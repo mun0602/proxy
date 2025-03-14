@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Ubuntu Proxy Server Setup Script
-# This script installs and configures either an HTTP proxy (Squid) or SOCKS5 proxy (Dante/3proxy) on Ubuntu
+# This script installs and configures either an HTTP proxy (Squid) or SOCKS5 proxy (Shadowsocks) on Ubuntu
 
 # Exit on error
 set -e
@@ -24,7 +24,7 @@ fi
 
 # Update system
 echo -e "${GREEN}Updating system packages...${NC}"
-apt update && apt upgrade -y
+apt update -y
 
 # Install curl if not already installed (needed for getting public IP)
 apt install -y curl
@@ -41,106 +41,91 @@ else
   echo -e "${GREEN}Detected public IP: $PUBLIC_IP${NC}"
 fi
 
+# Function to check if port is in use
+check_port() {
+  local port=$1
+  if netstat -tuln | grep -q ":$port "; then
+    echo -e "${RED}Port $port is already in use. Please choose another port.${NC}"
+    return 1
+  fi
+  return 0
+}
+
 # Choose proxy type
 echo -e "${YELLOW}Choose proxy type:${NC}"
 echo "1) HTTP proxy (Squid)"
-echo "2) SOCKS5 proxy (3proxy)"
+echo "2) SOCKS5 proxy (Shadowsocks)"
 read -p "Enter your choice [1-2]: " PROXY_TYPE
 
 case $PROXY_TYPE in
   2)
-    # Install and configure SOCKS5 proxy using 3proxy (more reliable than Dante)
-    echo -e "${GREEN}Installing SOCKS5 proxy server (3proxy)...${NC}"
+    # Install and configure SOCKS5 proxy using Shadowsocks
+    echo -e "${GREEN}Installing SOCKS5 proxy server (Shadowsocks)...${NC}"
     
-    # Install build tools
-    apt install -y gcc make wget
-
-    # Create temp directory and navigate to it
-    mkdir -p /tmp/3proxy
-    cd /tmp/3proxy
+    # Install dependencies
+    apt install -y python3-pip python3-setuptools
     
-    # Download and extract 3proxy
-    echo -e "${GREEN}Downloading 3proxy...${NC}"
-    wget -q https://github.com/3proxy/3proxy/archive/0.9.4.tar.gz
-    tar -xf 0.9.4.tar.gz
-    cd 3proxy-0.9.4
-    
-    # Compile and install
-    echo -e "${GREEN}Compiling 3proxy...${NC}"
-    make -f Makefile.Linux
-    mkdir -p /usr/local/etc/3proxy
-    mkdir -p /usr/local/bin
-    mkdir -p /usr/local/man/man3
-    make -f Makefile.Linux install
+    # Install Shadowsocks
+    echo -e "${GREEN}Installing Shadowsocks...${NC}"
+    pip3 install shadowsocks
     
     # Set proxy port
-    read -p "Enter port for SOCKS5 proxy server [1080]: " PROXY_PORT
-    PROXY_PORT=${PROXY_PORT:-1080}
+    while true; do
+      read -p "Enter port for SOCKS5 proxy server [8388]: " PROXY_PORT
+      PROXY_PORT=${PROXY_PORT:-8388}
+      if check_port $PROXY_PORT; then
+        break
+      fi
+    done
     
-    # Ask if authentication is needed
-    read -p "Do you want to set up authentication? (y/n): " AUTH_NEEDED
+    # Set password
+    read -s -p "Enter password for Shadowsocks (required): " SS_PASS
+    echo
     
-    # Create configuration directory if it doesn't exist
-    mkdir -p /usr/local/etc/3proxy
+    # Verify password is not empty
+    while [ -z "$SS_PASS" ]; do
+      echo -e "${RED}Password cannot be empty.${NC}"
+      read -s -p "Enter password for Shadowsocks (required): " SS_PASS
+      echo
+    done
+    
+    # Create configuration directory
+    mkdir -p /etc/shadowsocks
     
     # Create config file
-    if [[ "$AUTH_NEEDED" =~ ^[Yy]$ ]]; then
-      # Create user for 3proxy
-      echo -e "${GREEN}Setting up authentication...${NC}"
-      read -p "Enter username for proxy: " PROXY_USER
-      read -s -p "Enter password for proxy: " PROXY_PASS
-      echo
-      
-      # Create password file
-      echo "$PROXY_USER:CL:$PROXY_PASS" > /usr/local/etc/3proxy/passwd
-      
-      # Configure 3proxy with authentication
-      cat > /usr/local/etc/3proxy/3proxy.cfg << EOF
-#!/usr/local/bin/3proxy
-# 3proxy configuration with authentication
-
-daemon
-nscache 65536
-timeouts 1 5 30 60 180 1800 15 60
-log /var/log/3proxy.log
-logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
-rotate 30
-
-users $(cat /usr/local/etc/3proxy/passwd)
-
-auth strong
-
-# SOCKS5 proxy server
-socks -p$PROXY_PORT -a
+    cat > /etc/shadowsocks/config.json << EOF
+{
+  "server": "0.0.0.0",
+  "server_port": $PROXY_PORT,
+  "password": "$SS_PASS",
+  "timeout": 300,
+  "method": "aes-256-cfb",
+  "fast_open": false
+}
 EOF
-    else
-      # Configure 3proxy without authentication
-      cat > /usr/local/etc/3proxy/3proxy.cfg << EOF
-#!/usr/local/bin/3proxy
-# 3proxy configuration without authentication
-
-daemon
-nscache 65536
-timeouts 1 5 30 60 180 1800 15 60
-log /var/log/3proxy.log
-logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
-rotate 30
-
-# SOCKS5 proxy server
-socks -p$PROXY_PORT
-EOF
+    
+    # Fix the issue with the Crypto library (common in newer Python versions)
+    if ! pip3 show pycryptodome > /dev/null 2>&1; then
+      echo -e "${GREEN}Installing PyCryptodome...${NC}"
+      pip3 install pycryptodome
+    fi
+    
+    # Fix the issue with the openssl module if necessary
+    if grep -q "from OpenSSL import rand" /usr/local/lib/python*/dist-packages/shadowsocks/crypto/openssl.py 2>/dev/null; then
+      echo -e "${GREEN}Patching Shadowsocks for compatibility...${NC}"
+      sed -i 's/from OpenSSL import rand/from os import urandom as rand/g' /usr/local/lib/python*/dist-packages/shadowsocks/crypto/openssl.py
     fi
     
     # Create systemd service file
-    cat > /etc/systemd/system/3proxy.service << EOF
+    cat > /etc/systemd/system/shadowsocks.service << EOF
 [Unit]
-Description=3proxy Proxy Server
+Description=Shadowsocks Proxy Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
-ExecStop=/bin/kill -TERM \$MAINPID
+User=nobody
+ExecStart=/usr/local/bin/ssserver -c /etc/shadowsocks/config.json
 Restart=on-failure
 
 [Install]
@@ -149,44 +134,52 @@ EOF
     
     # Reload systemd, enable and start service
     systemctl daemon-reload
-    systemctl enable 3proxy
-    systemctl start 3proxy
+    systemctl enable shadowsocks
+    
+    # Start service with error handling
+    if ! systemctl start shadowsocks; then
+      echo -e "${RED}Failed to start Shadowsocks service. Trying alternative method...${NC}"
+      # Try running ssserver directly to see error output
+      echo -e "${YELLOW}Running Shadowsocks server directly to check for errors:${NC}"
+      echo "--------------------------------"
+      ssserver -c /etc/shadowsocks/config.json -d start
+      echo "--------------------------------"
+      
+      # Check if it's running
+      sleep 2
+      if pgrep -f ssserver > /dev/null; then
+        echo -e "${GREEN}Shadowsocks is now running using the direct method.${NC}"
+      else
+        echo -e "${RED}Failed to start Shadowsocks. Please check the error output above.${NC}"
+        exit 1
+      fi
+    fi
     
     # Configure firewall
     echo -e "${GREEN}Configuring firewall...${NC}"
     apt install -y ufw
     ufw allow ssh
     ufw allow $PROXY_PORT/tcp
+    ufw allow $PROXY_PORT/udp
     ufw --force enable
-    
-    # Verify service is running
-    if systemctl is-active --quiet 3proxy; then
-      echo -e "${GREEN}SOCKS5 proxy server is now running!${NC}"
-    else
-      echo -e "${RED}Failed to start SOCKS5 proxy server. Check logs with: journalctl -u 3proxy${NC}"
-      exit 1
-    fi
     
     # Display proxy information
     echo -e "${YELLOW}SOCKS5 Proxy Server Information:${NC}"
     echo "Public IP: $PUBLIC_IP"
     echo "Port: $PROXY_PORT"
-    if [[ "$AUTH_NEEDED" =~ ^[Yy]$ ]]; then
-      echo "Username: $PROXY_USER"
-      echo "Authentication: Enabled"
-    else
-      echo "Authentication: Disabled"
-    fi
+    echo "Password: $SS_PASS"
+    echo "Encryption: aes-256-cfb"
     
-    echo -e "${YELLOW}To use this proxy:${NC}"
-    echo "SOCKS5 Proxy: $PUBLIC_IP:$PROXY_PORT"
-    if [[ "$AUTH_NEEDED" =~ ^[Yy]$ ]]; then
-      echo "Credentials required: Yes (username and password)"
-    fi
+    echo -e "${YELLOW}To use this Shadowsocks proxy:${NC}"
+    echo "Server: $PUBLIC_IP"
+    echo "Port: $PROXY_PORT"
+    echo "Password: $SS_PASS"
+    echo "Encryption: aes-256-cfb"
     
-    # Clean up temporary files
-    cd /
-    rm -rf /tmp/3proxy
+    echo -e "${YELLOW}You can connect using any Shadowsocks client:${NC}"
+    echo "- Windows/macOS/Linux: Shadowsocks client"
+    echo "- Android: Shadowsocks for Android"
+    echo "- iOS: Shadowrocket"
     ;;
     
   *)
@@ -194,29 +187,32 @@ EOF
     echo -e "${GREEN}Installing HTTP proxy server (Squid)...${NC}"
     apt install -y squid apache2-utils
     
-    # Backup original configuration
-    echo -e "${GREEN}Backing up original Squid configuration...${NC}"
-    if [ -f /etc/squid/squid.conf ]; then
-      cp /etc/squid/squid.conf /etc/squid/squid.conf.bak
-    elif [ -f /etc/squid3/squid.conf ]; then
-      cp /etc/squid3/squid.conf /etc/squid3/squid.conf.bak
-      SQUID_CONFIG_DIR="/etc/squid3"
-    else
+    # Determine squid configuration directory
+    if [ -d /etc/squid ]; then
       SQUID_CONFIG_DIR="/etc/squid"
-    fi
-    
-    # Set squid configuration directory based on what exists
-    if [ -z "$SQUID_CONFIG_DIR" ]; then
-      if [ -d /etc/squid ]; then
+    else
+      SQUID_CONFIG_DIR="/etc/squid3"
+      # If neither exists, install squid and check again
+      if [ ! -d "$SQUID_CONFIG_DIR" ]; then
+        apt install -y squid
         SQUID_CONFIG_DIR="/etc/squid"
-      else
-        SQUID_CONFIG_DIR="/etc/squid3"
       fi
     fi
     
+    # Backup original configuration
+    echo -e "${GREEN}Backing up original Squid configuration...${NC}"
+    if [ -f "$SQUID_CONFIG_DIR/squid.conf" ]; then
+      cp "$SQUID_CONFIG_DIR/squid.conf" "$SQUID_CONFIG_DIR/squid.conf.bak"
+    fi
+    
     # Set proxy port (default: 3128)
-    read -p "Enter port for HTTP proxy server [3128]: " PROXY_PORT
-    PROXY_PORT=${PROXY_PORT:-3128}
+    while true; do
+      read -p "Enter port for HTTP proxy server [3128]: " PROXY_PORT
+      PROXY_PORT=${PROXY_PORT:-3128}
+      if check_port $PROXY_PORT; then
+        break
+      fi
+    done
     
     # Ask if authentication is needed
     read -p "Do you want to set up authentication? (y/n): " AUTH_NEEDED
@@ -227,9 +223,9 @@ EOF
       read -p "Enter username for proxy: " PROXY_USER
       
       # Create password file
-      touch $SQUID_CONFIG_DIR/passwd
-      htpasswd -c $SQUID_CONFIG_DIR/passwd $PROXY_USER
-      chown proxy:proxy $SQUID_CONFIG_DIR/passwd 2>/dev/null || true
+      touch "$SQUID_CONFIG_DIR/passwd"
+      htpasswd -bc "$SQUID_CONFIG_DIR/passwd" "$PROXY_USER" $(read -s -p "Enter password: " PASS && echo $PASS)
+      chown proxy:proxy "$SQUID_CONFIG_DIR/passwd" 2>/dev/null || true
       
       # Determine the path to basic_ncsa_auth
       BASIC_AUTH_PATH=""
@@ -242,11 +238,18 @@ EOF
       
       if [ -z "$BASIC_AUTH_PATH" ]; then
         echo -e "${RED}Could not find basic_ncsa_auth. Authentication might not work properly.${NC}"
-        BASIC_AUTH_PATH="/usr/lib/squid/basic_ncsa_auth"
+        # Find the path dynamically
+        BASIC_AUTH_PATH=$(find /usr -name basic_ncsa_auth 2>/dev/null | head -n 1)
+        if [ -z "$BASIC_AUTH_PATH" ]; then
+          echo -e "${RED}Still could not find basic_ncsa_auth. Using default path.${NC}"
+          BASIC_AUTH_PATH="/usr/lib/squid/basic_ncsa_auth"
+        else
+          echo -e "${GREEN}Found basic_ncsa_auth at $BASIC_AUTH_PATH${NC}"
+        fi
       fi
       
       # Create new Squid configuration with authentication
-      cat > $SQUID_CONFIG_DIR/squid.conf << EOF
+      cat > "$SQUID_CONFIG_DIR/squid.conf" << EOF
 # Squid configuration with basic authentication
 
 # Define ACL for localhost
@@ -277,7 +280,7 @@ EOF
     
     else
       # Create new Squid configuration without authentication
-      cat > $SQUID_CONFIG_DIR/squid.conf << EOF
+      cat > "$SQUID_CONFIG_DIR/squid.conf" << EOF
 # Squid configuration without authentication
 
 # Define ACL for localhost
@@ -320,7 +323,17 @@ EOF
     
     # Restart Squid service
     echo -e "${GREEN}Restarting Squid service...${NC}"
-    systemctl restart $SQUID_SERVICE
+    if ! systemctl restart $SQUID_SERVICE; then
+      echo -e "${RED}Failed to restart Squid service. Checking configuration...${NC}"
+      if [ -x /usr/sbin/squid ]; then
+        /usr/sbin/squid -k parse
+      elif [ -x /usr/sbin/squid3 ]; then
+        /usr/sbin/squid3 -k parse
+      fi
+      echo -e "${RED}Please fix the configuration issues and restart Squid manually.${NC}"
+      exit 1
+    fi
+    
     systemctl enable $SQUID_SERVICE
     
     # Verify service is running
