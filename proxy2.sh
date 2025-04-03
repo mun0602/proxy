@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script tự động cài đặt Squid trên cổng 1305 và xuất IP:PORT
+# Script tự động cài đặt Squid trên cổng ngẫu nhiên và xuất IP:PORT
 
 # Màu sắc cho output
 GREEN='\033[0;32m'
@@ -14,8 +14,17 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Cổng cố định là 1305
-PROXY_PORT=1305
+# Hàm để tạo cổng ngẫu nhiên và kiểm tra xem nó có đang được sử dụng không
+get_random_port() {
+  # Tạo cổng ngẫu nhiên trong khoảng 10000-65000
+  while true; do
+    RANDOM_PORT=$(shuf -i 10000-65000 -n 1)
+    if ! netstat -tuln | grep -q ":$RANDOM_PORT "; then
+      echo $RANDOM_PORT
+      return 0
+    fi
+  done
+}
 
 # Hàm lấy địa chỉ IP công cộng
 get_public_ip() {
@@ -28,12 +37,9 @@ get_public_ip() {
   fi
 }
 
-# Kiểm tra xem cổng có đang được sử dụng không
-if netstat -tuln | grep -q ":$PROXY_PORT "; then
-  echo -e "${YELLOW}Cổng $PROXY_PORT đã được sử dụng. Đang cố gắng ngừng dịch vụ...${NC}"
-  fuser -k $PROXY_PORT/tcp >/dev/null 2>&1
-  sleep 2
-fi
+# Lấy cổng ngẫu nhiên
+PROXY_PORT=$(get_random_port)
+echo -e "${GREEN}Đã chọn cổng ngẫu nhiên: $PROXY_PORT${NC}"
 
 # Cài đặt Squid
 apt update -y
@@ -57,7 +63,7 @@ fi
 
 # Tạo cấu hình Squid mới - đơn giản và cho phép mọi truy cập
 cat > "$SQUID_CONFIG_DIR/squid.conf" << EOF
-# Cấu hình Squid đơn giản
+# Cấu hình Squid đơn giản với cổng ngẫu nhiên
 acl localnet src all
 acl SSL_ports port 443
 acl Safe_ports port 80
@@ -74,7 +80,7 @@ acl Safe_ports port 777
 # Cho phép tất cả cổng
 http_access allow all
 
-# Cấu hình cổng
+# Cấu hình cổng ngẫu nhiên
 http_port $PROXY_PORT
 
 # Cài đặt DNS
@@ -83,6 +89,18 @@ dns_nameservers 8.8.8.8 8.8.4.4
 # Các cấu hình hiệu suất
 forwarded_for off
 via off
+request_header_access From deny all
+request_header_access Server deny all
+request_header_access WWW-Authenticate deny all
+request_header_access Link deny all
+request_header_access Cache-Control deny all
+request_header_access Proxy-Connection deny all
+request_header_access X-Cache deny all
+request_header_access X-Cache-Lookup deny all
+request_header_access Via deny all
+request_header_access X-Forwarded-For deny all
+request_header_access Pragma deny all
+request_header_access Keep-Alive deny all
 coredump_dir /var/spool/squid
 EOF
 
@@ -126,5 +144,5 @@ fi
 # Hiển thị thông tin proxy
 get_public_ip
 
-# In ra thông tin kết nối theo định dạng IP:1305
+# In ra thông tin kết nối theo định dạng IP:PORT
 echo -e "$PUBLIC_IP:$PROXY_PORT"
