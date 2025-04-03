@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script tự động cài đặt Squid với PAC file
-# Tạo proxy tự động với cổng ngẫu nhiên và cung cấp file PAC qua HTTP
+# Phiên bản sửa lỗi - sử dụng cổng chuẩn và cấu hình tường lửa
 
 # Màu sắc cho output
 GREEN='\033[0;32m'
@@ -42,14 +42,19 @@ get_public_ip() {
 PROXY_PORT=$(get_random_port)
 echo -e "${GREEN}Đã chọn cổng ngẫu nhiên cho Squid: $PROXY_PORT${NC}"
 
-# Lấy cổng ngẫu nhiên cho Web Server
-HTTP_PORT=$(get_random_port)
-echo -e "${GREEN}Đã chọn cổng ngẫu nhiên cho Web Server: $HTTP_PORT${NC}"
+# Sử dụng cổng 80 cho web server (cổng HTTP tiêu chuẩn)
+HTTP_PORT=80
+echo -e "${GREEN}Sử dụng cổng HTTP tiêu chuẩn: $HTTP_PORT${NC}"
 
 # Cài đặt các gói cần thiết
 echo -e "${GREEN}Đang cài đặt các gói cần thiết...${NC}"
 apt update -y
-apt install -y squid nginx curl netcat
+apt install -y squid nginx curl ufw netcat
+
+# Dừng các dịch vụ để cấu hình
+systemctl stop nginx 2>/dev/null
+systemctl stop squid 2>/dev/null
+systemctl stop squid3 2>/dev/null
 
 # Xác định thư mục cấu hình Squid
 if [ -d /etc/squid ]; then
@@ -70,24 +75,11 @@ fi
 # Tạo cấu hình Squid mới - đơn giản và cho phép mọi truy cập
 cat > "$SQUID_CONFIG_DIR/squid.conf" << EOF
 # Cấu hình Squid tối ưu
-acl localnet src all
-acl SSL_ports port 443
-acl Safe_ports port 80
-acl Safe_ports port 21
-acl Safe_ports port 443
-acl Safe_ports port 70
-acl Safe_ports port 210
-acl Safe_ports port 1025-65535
-acl Safe_ports port 280
-acl Safe_ports port 488
-acl Safe_ports port 591
-acl Safe_ports port 777
-
-# Cho phép tất cả cổng
-http_access allow all
-
-# Cấu hình cổng
 http_port $PROXY_PORT
+
+# Quyền truy cập cơ bản
+acl all src all
+http_access allow all
 
 # Cài đặt DNS
 dns_nameservers 8.8.8.8 8.8.4.4
@@ -95,34 +87,14 @@ dns_nameservers 8.8.8.8 8.8.4.4
 # Tối ưu hiệu suất
 cache_mem 256 MB
 maximum_object_size 10 MB
-maximum_object_size_in_memory 10 MB
-cache_replacement_policy heap LFUDA
-memory_replacement_policy heap LFUDA
 
 # Tăng tốc độ kết nối
-pipeline_prefetch on
 connect_timeout 15 seconds
 request_timeout 30 seconds
-persistent_request_timeout 1 minute
-client_lifetime 1 hour
 
 # Cấu hình ẩn danh
 forwarded_for off
 via off
-forwarded_for delete
-follow_x_forwarded_for deny all
-request_header_access From deny all
-request_header_access Server deny all
-request_header_access WWW-Authenticate deny all
-request_header_access Link deny all
-request_header_access Cache-Control deny all
-request_header_access Proxy-Connection deny all
-request_header_access X-Cache deny all
-request_header_access X-Cache-Lookup deny all
-request_header_access Via deny all
-request_header_access X-Forwarded-For deny all
-request_header_access Pragma deny all
-request_header_access Keep-Alive deny all
 
 coredump_dir /var/spool/squid
 EOF
@@ -130,36 +102,25 @@ EOF
 # Tạo thư mục cho PAC file
 mkdir -p /var/www/html
 
+# Lấy địa chỉ IP công cộng
+get_public_ip
+
 # Tạo PAC file
 cat > /var/www/html/proxy.pac << EOF
 function FindProxyForURL(url, host) {
-    // Các tên miền sẽ truy cập trực tiếp, không qua proxy
-    var directDomains = [
-        "localhost",
-        "127.0.0.1"
-    ];
-    
-    // Kiểm tra xem tên miền có nằm trong danh sách truy cập trực tiếp không
-    for (var i = 0; i < directDomains.length; i++) {
-        if (dnsDomainIs(host, directDomains[i]) || 
-            shExpMatch(host, directDomains[i])) {
-            return "DIRECT";
-        }
-    }
-    
-    // Sử dụng proxy cho mọi kết nối khác
+    // Sử dụng proxy cho mọi kết nối
     return "PROXY $PUBLIC_IP:$PROXY_PORT";
 }
 EOF
 
 # Cấu hình Nginx để phục vụ PAC file
-cat > /etc/nginx/sites-available/proxy-pac << EOF
+cat > /etc/nginx/sites-available/default << EOF
 server {
-    listen $HTTP_PORT default_server;
-    listen [::]:$HTTP_PORT default_server;
+    listen 80 default_server;
+    listen [::]:80 default_server;
     
     root /var/www/html;
-    index index.html index.htm;
+    index index.html;
     
     server_name _;
     
@@ -175,18 +136,15 @@ server {
 }
 EOF
 
-# Kích hoạt cấu hình Nginx
-ln -sf /etc/nginx/sites-available/proxy-pac /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
-
-# Lấy địa chỉ IP công cộng
-get_public_ip
-
-# Cập nhật PAC file với địa chỉ IP chính xác
-sed -i "s/PROXY \$PUBLIC_IP:\$PROXY_PORT/PROXY $PUBLIC_IP:$PROXY_PORT/g" /var/www/html/proxy.pac
-
-# Khởi động lại các dịch vụ
-echo -e "${GREEN}Đang khởi động lại dịch vụ...${NC}"
+# Cấu hình tường lửa
+echo -e "${GREEN}Đang cấu hình tường lửa...${NC}"
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow ssh
+ufw allow $HTTP_PORT/tcp
+ufw allow $PROXY_PORT/tcp
+ufw --force enable
 
 # Xác định tên dịch vụ squid
 if systemctl list-units --type=service | grep -q "squid.service"; then
@@ -197,47 +155,72 @@ else
   SQUID_SERVICE="squid"
 fi
 
-systemctl restart nginx
-systemctl restart $SQUID_SERVICE
+# Đảm bảo các dịch vụ được bật khi khởi động
+systemctl enable nginx
+systemctl enable $SQUID_SERVICE
 
-# Đợi dịch vụ khởi động
-sleep 3
+# Khởi động lại các dịch vụ
+echo -e "${GREEN}Đang khởi động các dịch vụ...${NC}"
+systemctl restart $SQUID_SERVICE
+sleep 2
+systemctl restart nginx
+sleep 2
 
 # Kiểm tra Squid
 if ! systemctl is-active --quiet $SQUID_SERVICE; then
-  echo -e "${RED}Không thể khởi động Squid. Đang thử phương pháp khác...${NC}"
-  if which squid > /dev/null; then
-    squid -f "$SQUID_CONFIG_DIR/squid.conf"
-    sleep 2
-  fi
+  echo -e "${RED}Không thể khởi động Squid tự động. Đang thử phương pháp khác...${NC}"
+  squid -f "$SQUID_CONFIG_DIR/squid.conf"
+  sleep 2
 fi
 
 # Kiểm tra Nginx
 if ! systemctl is-active --quiet nginx; then
-  echo -e "${RED}Không thể khởi động Nginx. Đang thử phương pháp khác...${NC}"
-  nginx -t
+  echo -e "${RED}Không thể khởi động Nginx tự động. Đang thử phương pháp khác...${NC}"
   nginx
   sleep 2
 fi
 
 # Kiểm tra lại các cổng
-if ! netstat -tuln | grep -q ":$PROXY_PORT "; then
-  echo -e "${RED}Cổng Squid $PROXY_PORT không mở. Kiểm tra lại cấu hình!${NC}"
-  echo -e "${YELLOW}Trạng thái Squid:${NC}"
-  systemctl status $SQUID_SERVICE --no-pager | head -n 10
+echo -e "${YELLOW}Đang kiểm tra các cổng...${NC}"
+echo -e "Cổng Squid ($PROXY_PORT): \c"
+if netstat -tuln | grep -q ":$PROXY_PORT "; then
+  echo -e "${GREEN}OK${NC}"
 else
-  echo -e "${GREEN}Squid proxy đang chạy trên cổng $PROXY_PORT${NC}"
+  echo -e "${RED}KHÔNG HOẠT ĐỘNG${NC}"
 fi
 
-if ! netstat -tuln | grep -q ":$HTTP_PORT "; then
-  echo -e "${RED}Cổng HTTP $HTTP_PORT không mở. Kiểm tra lại cấu hình!${NC}"
-  echo -e "${YELLOW}Trạng thái Nginx:${NC}"
-  systemctl status nginx --no-pager | head -n 10
+echo -e "Cổng HTTP ($HTTP_PORT): \c"
+if netstat -tuln | grep -q ":$HTTP_PORT "; then
+  echo -e "${GREEN}OK${NC}"
 else
-  echo -e "${GREEN}Web server đang chạy trên cổng $HTTP_PORT${NC}"
+  echo -e "${RED}KHÔNG HOẠT ĐỘNG${NC}"
 fi
+
+# Thử truy cập vào trang PAC trực tiếp để kiểm tra
+echo -e "${YELLOW}Đang kiểm tra PAC file...${NC}"
+HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/proxy.pac)
+if [ "$HTTP_RESPONSE" = "200" ]; then
+  echo -e "${GREEN}PAC file có thể truy cập được từ localhost${NC}"
+else
+  echo -e "${RED}Không thể truy cập PAC file (HTTP code: $HTTP_RESPONSE)${NC}"
+  echo -e "${YELLOW}Đang thử sửa quyền file...${NC}"
+  chmod 755 /var/www/html -R
+  chown www-data:www-data /var/www/html -R
+  systemctl restart nginx
+  sleep 2
+fi
+
+# Tạo một trang index đơn giản
+echo "<html><body><h1>Proxy PAC Setup</h1><p>Your proxy PAC file is available at: <a href='/proxy.pac'>proxy.pac</a></p></body></html>" > /var/www/html/index.html
 
 # In ra thông tin kết nối
-echo -e "${GREEN}Cấu hình proxy hoàn tất!${NC}"
+echo -e "\n${GREEN}============================================${NC}"
+echo -e "${GREEN}CẤU HÌNH PROXY HOÀN TẤT!${NC}"
+echo -e "${GREEN}============================================${NC}"
 echo -e "IP:Port proxy: ${GREEN}$PUBLIC_IP:$PROXY_PORT${NC}"
-echo -e "URL PAC file: ${GREEN}http://$PUBLIC_IP:$HTTP_PORT/proxy.pac${NC}"
+echo -e "URL PAC file: ${GREEN}http://$PUBLIC_IP/proxy.pac${NC}"
+echo -e "${GREEN}============================================${NC}"
+
+# Hiển thị nội dung PAC file
+echo -e "\n${YELLOW}Nội dung PAC file:${NC}"
+cat /var/www/html/proxy.pac
