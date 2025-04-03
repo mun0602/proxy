@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script tự động cài đặt Squid trên cổng 33 và xuất IP:PORT
+# Script tự động cài đặt Squid trên cổng 1305 và xuất IP:PORT
 
 # Màu sắc cho output
 GREEN='\033[0;32m'
@@ -14,13 +14,13 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Cổng cố định là 33
-PROXY_PORT=33
+# Cổng cố định là 1305
+PROXY_PORT=1305
 
 # Hàm lấy địa chỉ IP công cộng
 get_public_ip() {
-  echo -e "${GREEN}Đang xác định địa chỉ IP công cộng...${NC}"
-  PUBLIC_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || curl -s https://icanhazip.com)
+  # Sử dụng nhiều dịch vụ để đảm bảo lấy được IP
+  PUBLIC_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || curl -s https://icanhazip.com || curl -s https://ipinfo.io/ip)
 
   if [ -z "$PUBLIC_IP" ]; then
     echo -e "${YELLOW}Không thể xác định địa chỉ IP công cộng. Sử dụng IP local thay thế.${NC}"
@@ -36,9 +36,8 @@ if netstat -tuln | grep -q ":$PROXY_PORT "; then
 fi
 
 # Cài đặt Squid
-echo -e "${GREEN}Đang cài đặt Squid HTTP Proxy...${NC}"
 apt update -y
-apt install -y squid
+apt install -y squid netcat
 
 # Xác định thư mục cấu hình Squid
 if [ -d /etc/squid ]; then
@@ -51,32 +50,41 @@ else
   fi
 fi
 
-# Tạo cấu hình Squid mới
+# Sao lưu cấu hình Squid gốc nếu tồn tại
+if [ -f "$SQUID_CONFIG_DIR/squid.conf" ]; then
+  cp "$SQUID_CONFIG_DIR/squid.conf" "$SQUID_CONFIG_DIR/squid.conf.bak"
+fi
+
+# Tạo cấu hình Squid mới - đơn giản và cho phép mọi truy cập
 cat > "$SQUID_CONFIG_DIR/squid.conf" << EOF
 # Cấu hình Squid đơn giản
-acl localhost src 127.0.0.1/32 ::1
-acl to_localhost dst 127.0.0.0/8 0.0.0.0/32 ::1
+acl localnet src all
+acl SSL_ports port 443
+acl Safe_ports port 80
+acl Safe_ports port 21
+acl Safe_ports port 443
+acl Safe_ports port 70
+acl Safe_ports port 210
+acl Safe_ports port 1025-65535
+acl Safe_ports port 280
+acl Safe_ports port 488
+acl Safe_ports port 591
+acl Safe_ports port 777
+
+# Cho phép tất cả cổng
+http_access allow all
 
 # Cấu hình cổng
 http_port $PROXY_PORT
 
-# Kiểm soát truy cập
-http_access allow all
-
 # Cài đặt DNS
 dns_nameservers 8.8.8.8 8.8.4.4
 
-# Cài đặt hiệu suất cơ bản
-cache_mem 256 MB
-maximum_object_size 100 MB
+# Các cấu hình hiệu suất
+forwarded_for off
+via off
+coredump_dir /var/spool/squid
 EOF
-
-# Cấu hình tường lửa
-echo -e "${GREEN}Đang cấu hình tường lửa...${NC}"
-apt install -y ufw
-ufw allow ssh
-ufw allow $PROXY_PORT/tcp
-ufw --force enable
 
 # Xác định tên dịch vụ squid
 if systemctl list-units --type=service | grep -q "squid.service"; then
@@ -88,32 +96,35 @@ else
 fi
 
 # Khởi động lại dịch vụ Squid
-echo -e "${GREEN}Đang khởi động lại dịch vụ Squid...${NC}"
-systemctl restart $SQUID_SERVICE
+systemctl stop $SQUID_SERVICE 2>/dev/null
+sleep 1
+systemctl start $SQUID_SERVICE
 systemctl enable $SQUID_SERVICE
 
+# Đợi dịch vụ khởi động hoàn tất
+sleep 3
+
 # Kiểm tra xem dịch vụ có đang chạy không
-if systemctl is-active --quiet $SQUID_SERVICE; then
-  echo -e "${GREEN}HTTP proxy server đang chạy!${NC}"
-else
+if ! systemctl is-active --quiet $SQUID_SERVICE; then
   echo -e "${RED}Không thể khởi động HTTP proxy server. Đang thử phương pháp khác...${NC}"
   # Thử cách khác để khởi động dịch vụ
   if which squid > /dev/null; then
     squid -f "$SQUID_CONFIG_DIR/squid.conf"
     sleep 2
-    if pgrep -x "squid" > /dev/null; then
-      echo -e "${GREEN}HTTP proxy server đang chạy!${NC}"
-    else
-      echo -e "${RED}Không thể khởi động Squid. Vui lòng kiểm tra lại.${NC}"
-      exit 1
-    fi
   fi
+fi
+
+# Kiểm tra xem cổng có được mở không
+if ! netstat -tuln | grep -q ":$PROXY_PORT "; then
+  echo -e "${RED}Không thể mở cổng $PROXY_PORT. Kiểm tra lại cấu hình.${NC}"
+  # Hiển thị thông tin gỡ lỗi
+  echo -e "${YELLOW}Trạng thái dịch vụ:${NC}"
+  systemctl status $SQUID_SERVICE --no-pager | head -n 20
+  exit 1
 fi
 
 # Hiển thị thông tin proxy
 get_public_ip
 
-# In ra thông tin kết nối theo định dạng ip:33
-echo -e "\n${GREEN}$PUBLIC_IP:$PROXY_PORT${NC}"
-
-# Không hiển thị thông tin khác, chỉ hiển thị IP:PORT
+# In ra thông tin kết nối theo định dạng IP:1305
+echo -e "$PUBLIC_IP:$PROXY_PORT"
