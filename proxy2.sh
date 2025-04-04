@@ -142,11 +142,14 @@ acl kuaishou dstdomain .kuaishou.com .gifshow.com .yxixy.com
 acl douyin dstdomain .douyin.com .tiktokv.com .bytedance.com .iesdouyin.com .amemv.com
 acl wechat dstdomain .wechat.com .weixin.qq.com .wx.qq.com .weixinbridge.com .wechat.com
 
-# Ưu tiên băng thông cho các dịch vụ này
+# Trang kiểm tra IP và tốc độ
+acl ipcheck dstdomain .ipleak.net .speedtest.net .fast.com .netflix.com .nflxvideo.net .nflximg.net .ooklaserver.net .cloudfront.net
+
+# Ưu tiên băng thông cho các dịch vụ
 delay_pools 1
 delay_class 1 1
 delay_parameters 1 -1/-1
-delay_access 1 allow kuaishou douyin wechat
+delay_access 1 allow kuaishou douyin wechat ipcheck
 delay_access 1 deny all
 
 # Quyền truy cập
@@ -180,11 +183,11 @@ mkdir -p /var/www/html
 # Lấy địa chỉ IP công cộng
 get_public_ip
 
-# Tạo PAC file tối ưu cho các ứng dụng Trung Quốc
+# Tạo PAC file tối ưu cho các ứng dụng Trung Quốc và trang kiểm tra IP/tốc độ
 cat > /var/www/html/proxy.pac << EOF
 function FindProxyForURL(url, host) {
-    // Các domain cần dùng proxy (Kuaishou, Douyin, WeChat)
-    var cn_domains = [
+    // Các domain cần dùng proxy
+    var proxy_domains = [
         // Kuaishou domains
         ".kuaishou.com",
         ".gifshow.com",
@@ -201,7 +204,17 @@ function FindProxyForURL(url, host) {
         ".wechat.com",
         ".weixin.qq.com",
         ".wx.qq.com",
-        ".weixinbridge.com"
+        ".weixinbridge.com",
+        
+        // IP/Speed testing services
+        ".ipleak.net",
+        ".speedtest.net",
+        ".fast.com",
+        ".netflix.com",        // Needed for fast.com
+        ".nflxvideo.net",      // Needed for fast.com
+        ".nflximg.net",        // Needed for fast.com
+        ".ooklaserver.net",    // Needed for speedtest.net
+        ".cloudfront.net"      // Needed for various services
     ];
     
     // Kiểm tra IP trong dải Trung Quốc
@@ -216,9 +229,9 @@ function FindProxyForURL(url, host) {
     }
     
     // Kiểm tra domain trong danh sách
-    for (var i = 0; i < cn_domains.length; i++) {
-        if (dnsDomainIs(host, cn_domains[i]) || 
-            shExpMatch(host, "*" + cn_domains[i] + "*")) {
+    for (var i = 0; i < proxy_domains.length; i++) {
+        if (dnsDomainIs(host, proxy_domains[i]) || 
+            shExpMatch(host, "*" + proxy_domains[i] + "*")) {
             return "PROXY $PROXY_USER:$PROXY_PASS@$PUBLIC_IP:$PROXY_PORT";
         }
     }
@@ -282,100 +295,19 @@ server {
 }
 EOF
 
-# Tạo trang index đẹp mắt
+# Tạo trang index đơn giản chỉ hiển thị thông tin cơ bản
 cat > /var/www/html/index.html << EOF
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
+    <title>Proxy Info</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Proxy Configuration</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            line-height: 1.6;
-            margin: 0;
-            padding: 20px;
-            color: #333;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            padding: 20px;
-            border-radius: 5px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2c3e50;
-            border-bottom: 2px solid #eee;
-            padding-bottom: 10px;
-        }
-        .details {
-            background: #f9f9f9;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-        code {
-            background: #e9e9e9;
-            padding: 2px 5px;
-            border-radius: 3px;
-            font-family: monospace;
-        }
-        .btn {
-            display: inline-block;
-            background: #3498db;
-            color: white;
-            padding: 10px 15px;
-            text-decoration: none;
-            border-radius: 3px;
-            margin-top: 10px;
-        }
-    </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Proxy Configuration</h1>
-        <p>Your proxy has been set up successfully. Use the information below to configure your devices.</p>
-        
-        <div class="details">
-            <h2>Proxy Details</h2>
-            <p><strong>Server:</strong> <code>$PUBLIC_IP</code></p>
-            <p><strong>Port:</strong> <code>$PROXY_PORT</code></p>
-            <p><strong>Username:</strong> <code>$PROXY_USER</code></p>
-            <p><strong>Password:</strong> <code>$PROXY_PASS</code></p>
-            <p><strong>PAC URL:</strong> <code>http://$PUBLIC_IP/proxy.pac</code></p>
-            <a href="/proxy.pac" class="btn">Download PAC File</a>
-        </div>
-        
-        <h2>Setup Instructions</h2>
-        <h3>For Windows:</h3>
-        <ol>
-            <li>Open Settings > Network & Internet > Proxy</li>
-            <li>Enable "Use setup script"</li>
-            <li>Enter script address: <code>http://$PUBLIC_IP/proxy.pac</code></li>
-            <li>Click Save</li>
-        </ol>
-        
-        <h3>For iOS/macOS:</h3>
-        <ol>
-            <li>Go to Settings > Wi-Fi</li>
-            <li>Tap the (i) icon next to your network</li>
-            <li>Scroll down to "HTTP Proxy" and select "Auto"</li>
-            <li>Enter the URL: <code>http://$PUBLIC_IP/proxy.pac</code></li>
-        </ol>
-        
-        <h3>For Android:</h3>
-        <ol>
-            <li>Go to Settings > Wi-Fi</li>
-            <li>Long press your connected network</li>
-            <li>Select "Modify network"</li>
-            <li>Set Proxy to "Proxy Auto-Config"</li>
-            <li>Enter the PAC URL: <code>http://$PUBLIC_IP/proxy.pac</code></li>
-        </ol>
-    </div>
+    <h3>Proxy: $PUBLIC_IP:$PROXY_PORT</h3>
+    <p>User: $PROXY_USER</p>
+    <p>Pass: $PROXY_PASS</p>
+    <p><a href="/proxy.pac">PAC File</a></p>
 </body>
 </html>
 EOF
