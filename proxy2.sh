@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Script tự động cài đặt Squid với PAC file
-# Phiên bản sửa lỗi - sử dụng cổng chuẩn và cấu hình tường lửa
+# Script tự động cài đặt Squid với PAC file, xác thực và Cloudflare DNS
+# Phiên bản bảo mật - thêm xác thực và sử dụng DNS của Cloudflare
 
 # Màu sắc cho output
 GREEN='\033[0;32m'
@@ -38,18 +38,45 @@ get_public_ip() {
   fi
 }
 
+# Tạo username và password ngẫu nhiên hoặc sử dụng tùy chọn dòng lệnh
+generate_credentials() {
+  if [ -z "$PROXY_USER" ]; then
+    PROXY_USER="user$(openssl rand -hex 3)"
+  fi
+  
+  if [ -z "$PROXY_PASS" ]; then
+    PROXY_PASS="pass$(openssl rand -hex 6)"
+  fi
+  
+  echo -e "${GREEN}Đã tạo thông tin xác thực:${NC}"
+  echo -e "Username: ${YELLOW}$PROXY_USER${NC}"
+  echo -e "Password: ${YELLOW}$PROXY_PASS${NC}"
+}
+
+# Phân tích tham số dòng lệnh
+while getopts "u:p:" opt; do
+  case $opt in
+    u) PROXY_USER="$OPTARG" ;;
+    p) PROXY_PASS="$OPTARG" ;;
+    \?) echo "Tùy chọn không hợp lệ: -$OPTARG" >&2; exit 1 ;;
+  esac
+done
+
 # Lấy cổng ngẫu nhiên cho Squid
 PROXY_PORT=$(get_random_port)
 echo -e "${GREEN}Đã chọn cổng ngẫu nhiên cho Squid: $PROXY_PORT${NC}"
 
-# Sử dụng cổng 80 cho web server (cổng HTTP tiêu chuẩn)
+# Sử dụng cổng 80 cho web server
 HTTP_PORT=80
 echo -e "${GREEN}Sử dụng cổng HTTP tiêu chuẩn: $HTTP_PORT${NC}"
+
+# Tạo thông tin xác thực
+generate_credentials
 
 # Cài đặt các gói cần thiết
 echo -e "${GREEN}Đang cài đặt các gói cần thiết...${NC}"
 apt update -y
-apt install -y squid nginx curl ufw netcat
+apt install -y squid apache2-utils nginx curl ufw netcat
 
 # Dừng các dịch vụ để cấu hình
 systemctl stop nginx 2>/dev/null
@@ -72,17 +99,46 @@ if [ -f "$SQUID_CONFIG_DIR/squid.conf" ]; then
   cp "$SQUID_CONFIG_DIR/squid.conf" "$SQUID_CONFIG_DIR/squid.conf.bak"
 fi
 
-# Tạo cấu hình Squid mới - đơn giản và cho phép mọi truy cập
+# Tạo file mật khẩu cho Squid
+echo -e "${GREEN}Đang tạo file xác thực...${NC}"
+touch "$SQUID_CONFIG_DIR/passwd"
+htpasswd -b -c "$SQUID_CONFIG_DIR/passwd" "$PROXY_USER" "$PROXY_PASS"
+chmod 644 "$SQUID_CONFIG_DIR/passwd"
+
+# Xác định đường dẫn đến basic_ncsa_auth
+BASIC_AUTH_PATH=""
+for path in "/usr/lib/squid/basic_ncsa_auth" "/usr/lib/squid3/basic_ncsa_auth" "/usr/libexec/squid/basic_ncsa_auth"; do
+  if [ -f "$path" ]; then
+    BASIC_AUTH_PATH="$path"
+    break
+  fi
+done
+
+if [ -z "$BASIC_AUTH_PATH" ]; then
+  BASIC_AUTH_PATH=$(find /usr -name basic_ncsa_auth 2>/dev/null | head -n 1)
+  if [ -z "$BASIC_AUTH_PATH" ]; then
+    echo -e "${RED}Không thể tìm thấy basic_ncsa_auth.${NC}"
+    BASIC_AUTH_PATH="/usr/lib/squid/basic_ncsa_auth" # Đường dẫn mặc định
+  fi
+fi
+
+# Tạo cấu hình Squid mới với xác thực và Cloudflare DNS
 cat > "$SQUID_CONFIG_DIR/squid.conf" << EOF
-# Cấu hình Squid tối ưu
+# Cấu hình Squid tối ưu với xác thực và Cloudflare DNS
 http_port $PROXY_PORT
 
-# Quyền truy cập cơ bản
-acl all src all
-http_access allow all
+# Cấu hình xác thực
+auth_param basic program $BASIC_AUTH_PATH $SQUID_CONFIG_DIR/passwd
+auth_param basic realm Proxy Authentication Required
+auth_param basic credentialsttl 2 hours
+acl authenticated_users proxy_auth REQUIRED
 
-# Cài đặt DNS
-dns_nameservers 8.8.8.8 8.8.4.4
+# Quyền truy cập cơ bản
+http_access allow authenticated_users
+http_access deny all
+
+# Sử dụng DNS của Cloudflare
+dns_nameservers 1.1.1.1 1.0.0.1
 
 # Tối ưu hiệu suất
 cache_mem 256 MB
@@ -105,12 +161,110 @@ mkdir -p /var/www/html
 # Lấy địa chỉ IP công cộng
 get_public_ip
 
-# Tạo PAC file
+# Tạo PAC file - lưu ý không thể nhúng thông tin xác thực trực tiếp vào PAC
 cat > /var/www/html/proxy.pac << EOF
 function FindProxyForURL(url, host) {
-    // Sử dụng proxy cho mọi kết nối
+    // Các tên miền truy cập trực tiếp, không qua proxy
+    var directDomains = [
+        "localhost",
+        "127.0.0.1"
+    ];
+    
+    // Kiểm tra xem tên miền có nằm trong danh sách truy cập trực tiếp không
+    for (var i = 0; i < directDomains.length; i++) {
+        if (dnsDomainIs(host, directDomains[i]) || 
+            shExpMatch(host, directDomains[i])) {
+            return "DIRECT";
+        }
+    }
+    
+    // Sử dụng proxy cho mọi kết nối khác
     return "PROXY $PUBLIC_IP:$PROXY_PORT";
 }
+EOF
+
+# Tạo trang chỉ dẫn với thông tin xác thực
+cat > /var/www/html/index.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Proxy Configuration</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: #f9f9f9;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #2980b9;
+        }
+        .credentials {
+            background: #e8f4f8;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+        }
+        .code {
+            background: #f1f1f1;
+            padding: 10px;
+            border-radius: 3px;
+            font-family: monospace;
+            overflow-x: auto;
+        }
+        .important {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Proxy Configuration</h1>
+        
+        <h2>Proxy Information</h2>
+        <div class="credentials">
+            <p><strong>Proxy Server:</strong> $PUBLIC_IP</p>
+            <p><strong>Port:</strong> $PROXY_PORT</p>
+            <p><strong>Username:</strong> $PROXY_USER</p>
+            <p><strong>Password:</strong> $PROXY_PASS</p>
+            <p><strong>Full URL:</strong> <span class="code">http://$PROXY_USER:$PROXY_PASS@$PUBLIC_IP:$PROXY_PORT</span></p>
+        </div>
+        
+        <h2>Automatic Configuration (PAC)</h2>
+        <p>Use this URL in your browser's proxy settings for automatic configuration:</p>
+        <p class="code">http://$PUBLIC_IP/proxy.pac</p>
+        <p class="important">Note: When using PAC file, you'll still need to enter username and password when prompted.</p>
+        
+        <h2>Manual Configuration</h2>
+        <p>Alternatively, you can configure your proxy settings manually:</p>
+        <ul>
+            <li>Proxy Type: HTTP</li>
+            <li>Proxy Server: $PUBLIC_IP</li>
+            <li>Port: $PROXY_PORT</li>
+            <li>Username: $PROXY_USER</li>
+            <li>Password: $PROXY_PASS</li>
+        </ul>
+        
+        <h2>Download PAC File</h2>
+        <p><a href="/proxy.pac">Download PAC File</a></p>
+    </div>
+</body>
+</html>
 EOF
 
 # Cấu hình Nginx để phục vụ PAC file
@@ -210,17 +364,15 @@ else
   sleep 2
 fi
 
-# Tạo một trang index đơn giản
-echo "<html><body><h1>Proxy PAC Setup</h1><p>Your proxy PAC file is available at: <a href='/proxy.pac'>proxy.pac</a></p></body></html>" > /var/www/html/index.html
-
 # In ra thông tin kết nối
 echo -e "\n${GREEN}============================================${NC}"
-echo -e "${GREEN}CẤU HÌNH PROXY HOÀN TẤT!${NC}"
+echo -e "${GREEN}CẤU HÌNH PROXY BẢO MẬT HOÀN TẤT!${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo -e "IP:Port proxy: ${GREEN}$PUBLIC_IP:$PROXY_PORT${NC}"
+echo -e "Username: ${GREEN}$PROXY_USER${NC}"
+echo -e "Password: ${GREEN}$PROXY_PASS${NC}"
 echo -e "URL PAC file: ${GREEN}http://$PUBLIC_IP/proxy.pac${NC}"
+echo -e "URL thông tin: ${GREEN}http://$PUBLIC_IP/${NC}"
 echo -e "${GREEN}============================================${NC}"
-
-# Hiển thị nội dung PAC file
-echo -e "\n${YELLOW}Nội dung PAC file:${NC}"
-cat /var/www/html/proxy.pac
+echo -e "${YELLOW}Lưu ý: Mặc dù PAC file đã được cấu hình, bạn vẫn cần nhập tài khoản và mật khẩu khi trình duyệt yêu cầu. ${NC}"
+echo -e "${YELLOW}Truy cập http://$PUBLIC_IP/ để xem hướng dẫn đầy đủ và thông tin xác thực.${NC}"
