@@ -13,7 +13,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "${BLUE}=== KHẮC PHỤC TRIỆT ĐỂ HTTP BRIDGE KHÔNG ĐỔI IP ====${NC}"
+echo -e "${BLUE}=== SCRIPT TỐI ƯU V2RAY HTTP - SHADOWSOCKS BRIDGE VỚI 2GB RAM ẢO ===${NC}"
 
 # Lấy địa chỉ IP công cộng
 PUBLIC_IP=$(curl -s https://checkip.amazonaws.com || curl -s https://api.ipify.org || curl -s https://ifconfig.me)
@@ -24,294 +24,286 @@ fi
 
 # Thông số cấu hình
 HTTP_PROXY_PORT=8118
-SOCKS_PORT=1080
 SS_PORT=8388
-SS_PASSWORD=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+WS_PORT=10086
+SS_PASSWORD=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 16)
 SS_METHOD="chacha20-ietf-poly1305"
-DNS_SERVER="8.8.8.8,8.8.4.4"
-TAG="Fix-$(date +%s)"
+UUID=$(cat /proc/sys/kernel/random/uuid)
+WS_PATH="/$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
 
 #############################################
-# PHẦN 1: KHẮC PHỤC VẤN ĐỀ IPV6 VÀ DNS
+# PHẦN 1: CẤU HÌNH HỆ THỐNG VÀ RAM ẢO
 #############################################
 
-echo -e "${GREEN}[1/8] Vô hiệu hóa IPv6 và cấu hình DNS...${NC}"
+echo -e "${GREEN}[1/7] Cấu hình hệ thống và RAM ảo...${NC}"
 
-# Vô hiệu hóa IPv6 để tránh rò rỉ
-cat > /etc/sysctl.d/99-disable-ipv6.conf << EOF
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
-sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+# Tạo 2GB swap
+echo -e "${YELLOW}Tạo 2GB RAM ảo (swap)...${NC}"
+# Xóa swap cũ nếu có
+swapoff -a &>/dev/null
+rm -f /swapfile
 
-# Cấu hình DNS cố định
-cat > /etc/resolv.conf << EOF
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
-chattr +i /etc/resolv.conf
+# Tạo swap mới
+fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
 
-# Cấu hình NetworkManager (nếu có)
-if [ -d "/etc/NetworkManager" ]; then
-  cat > /etc/NetworkManager/conf.d/dns.conf << EOF
-[main]
-dns=none
-EOF
-  systemctl restart NetworkManager || true
+# Thêm vào fstab nếu chưa có
+if ! grep -q '/swapfile' /etc/fstab; then
+    echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
 fi
 
+# Cấu hình swap
+echo -e "${YELLOW}Tối ưu cấu hình swap...${NC}"
+cat > /etc/sysctl.d/99-swap.conf << EOF
+# Giảm swappiness để ưu tiên sử dụng RAM
+vm.swappiness = 10
+# Tăng giá trị cache để cải thiện hiệu suất
+vm.vfs_cache_pressure = 50
+# Tối ưu hóa kết nối mạng
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_fastopen = 3
+EOF
+sysctl -p /etc/sysctl.d/99-swap.conf
+
+# Tối ưu hóa limits.conf cho hiệu suất
+cat > /etc/security/limits.d/proxy-limits.conf << EOF
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+
+echo -e "${GREEN}✅ RAM ảo và cấu hình hệ thống đã được tối ưu hóa${NC}"
+
 #############################################
-# PHẦN 2: DỪNG DỊCH VỤ CŨ
+# PHẦN 2: CÀI ĐẶT PHẦN MỀM
 #############################################
 
-echo -e "${GREEN}[2/8] Dừng dịch vụ cũ...${NC}"
-
-# Dừng các dịch vụ nếu tồn tại
-for service in v2ray v2ray-client v2ray-server xray xray-server xray-client tinyproxy gost-bridge ss-local shadowsocks-libev; do
-  if systemctl list-unit-files | grep -q $service; then
-    systemctl stop $service 2>/dev/null
-    systemctl disable $service 2>/dev/null
-  fi
-done
-
-#############################################
-# PHẦN 3: CÀI ĐẶT CÁC GÓI CẦN THIẾT
-#############################################
-
-echo -e "${GREEN}[3/8] Cài đặt các gói cần thiết...${NC}"
+echo -e "${GREEN}[2/7] Cài đặt các gói cần thiết...${NC}"
 apt update -y
-apt install -y curl wget unzip tinyproxy net-tools dnsutils iptables-persistent nginx mtr traceroute jq
+apt install -y curl wget unzip jq nginx htop net-tools uuid-runtime lsb-release
 
-# Tạo 2GB swap nếu chưa có
-if [ "$(free | grep -c Swap)" -eq 0 ] || [ "$(free | grep Swap | awk '{print $2}')" -lt 1000000 ]; then
-    echo -e "${YELLOW}Tạo 2GB RAM ảo (swap)...${NC}"
-    swapoff -a &>/dev/null
-    rm -f /swapfile
-    fallocate -l 2G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    if ! grep -q '/swapfile' /etc/fstab; then
-        echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
-    fi
-    echo 10 > /proc/sys/vm/swappiness
+# Cài đặt apt-fast nếu có thể để tăng tốc độ tải
+if ! command -v apt-fast > /dev/null; then
+  if command -v add-apt-repository > /dev/null; then
+    add-apt-repository -y ppa:apt-fast/stable
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt install -y apt-fast
+  else
+    apt install -y software-properties-common
+    add-apt-repository -y ppa:apt-fast/stable
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt install -y apt-fast
+  fi
 fi
 
+# Nếu apt-fast đã được cài đặt, sử dụng nó để cài đặt các gói còn lại
+if command -v apt-fast > /dev/null; then
+  apt-fast install -y ca-certificates preload zlib1g-dev
+else
+  apt install -y ca-certificates preload zlib1g-dev
+fi
+
+# Tối ưu preload
+echo -e "${YELLOW}Tối ưu hóa preload...${NC}"
+cat > /etc/preload.conf << EOF
+[memload]
+# Tăng cache thêm 20%
+memloadcycle = 120
+ioprio = 3
+
+[processes]
+expiretime = 14
+autosave = 60
+
+[statfs]
+timeout = 3600
+
+[system]
+maxsize = 303
+EOF
+systemctl enable preload
+systemctl restart preload
+
 #############################################
-# PHẦN 4: TRIỂN KHAI SHADOWSOCKS HIỆU SUẤT CAO
+# PHẦN 3: CÀI ĐẶT V2RAY
 #############################################
 
-echo -e "${GREEN}[4/8] Cài đặt Shadowsocks hiệu suất cao...${NC}"
+echo -e "${GREEN}[3/7] Cài đặt V2Ray...${NC}"
+bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)
 
-# Cài đặt Shadowsocks-rust (hiệu suất cao hơn bản libev)
-ARCH=$(uname -m)
-case $ARCH in
-  x86_64)
-    SS_ARCH="x86_64-unknown-linux-gnu"
-    ;;
-  aarch64)
-    SS_ARCH="aarch64-unknown-linux-gnu"
-    ;;
-  *)
-    echo -e "${RED}Kiến trúc CPU không được hỗ trợ: $ARCH${NC}"
-    exit 1
-    ;;
-esac
+# Tạo thư mục log nếu không tồn tại
+mkdir -p /var/log/v2ray
+touch /var/log/v2ray/access.log
+touch /var/log/v2ray/error.log
+chown -R nobody:nogroup /var/log/v2ray
 
-# Tải và cài đặt Shadowsocks-rust
-mkdir -p /tmp/shadowsocks
-cd /tmp/shadowsocks
-wget -q "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v1.15.4/shadowsocks-v1.15.4.$SS_ARCH.tar.xz"
-tar -xf "shadowsocks-v1.15.4.$SS_ARCH.tar.xz"
-cp ssserver sslocal ssurl /usr/local/bin/
-chmod +x /usr/local/bin/ssserver /usr/local/bin/sslocal /usr/local/bin/ssurl
-
-# Cấu hình Shadowsocks server
-mkdir -p /etc/shadowsocks-rust
-cat > /etc/shadowsocks-rust/config.json << EOF
+# Tối ưu cấu hình V2Ray - Sử dụng V2Ray cho HTTP và Shadowsocks
+cat > /usr/local/etc/v2ray/config.json << EOF
 {
-    "server": "0.0.0.0",
-    "server_port": $SS_PORT,
-    "password": "$SS_PASSWORD",
-    "timeout": 300,
-    "method": "$SS_METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "nameserver": "$DNS_SERVER"
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/v2ray/access.log",
+    "error": "/var/log/v2ray/error.log"
+  },
+  "inbounds": [
+    {
+      "port": $HTTP_PROXY_PORT,
+      "listen": "0.0.0.0",
+      "protocol": "http",
+      "settings": {
+        "timeout": 300,
+        "allowTransparent": false
+      },
+      "tag": "http_in",
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "port": $WS_PORT,
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "alterId": 0,
+            "security": "auto"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "$WS_PATH"
+        },
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tproxy": "redirect"
+        }
+      },
+      "tag": "vmess_in",
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "port": $SS_PORT,
+      "listen": "127.0.0.1",
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "$SS_METHOD",
+        "password": "$SS_PASSWORD",
+        "network": "tcp,udp"
+      },
+      "tag": "ss_in",
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      },
+      "tag": "direct"
+    },
+    {
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": $SS_PORT,
+            "method": "$SS_METHOD",
+            "password": "$SS_PASSWORD"
+          }
+        ]
+      },
+      "tag": "ss_out"
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blocked"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["http_in"],
+        "outboundTag": "ss_out"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["vmess_in", "ss_in"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "direct"
+      }
+    ]
+  },
+  "policy": {
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  }
 }
 EOF
 
-# Cấu hình Shadowsocks local SOCKS proxy
-cat > /etc/shadowsocks-rust/local.json << EOF
-{
-    "server": "127.0.0.1",
-    "server_port": $SS_PORT,
-    "password": "$SS_PASSWORD",
-    "local_address": "127.0.0.1",
-    "local_port": $SOCKS_PORT,
-    "timeout": 300,
-    "method": "$SS_METHOD",
-    "fast_open": true,
-    "mode": "tcp_and_udp",
-    "no_delay": true
-}
-EOF
-
-# Tạo systemd service cho Shadowsocks server
-cat > /etc/systemd/system/shadowsocks-rust-server.service << EOF
+# Tối ưu V2Ray service
+cat > /etc/systemd/system/v2ray.service << EOF
 [Unit]
-Description=Shadowsocks Rust Server
-After=network.target
+Description=V2Ray Service
+Documentation=https://www.v2fly.org/
+After=network.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=nobody
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-ExecStart=/usr/local/bin/ssserver -c /etc/shadowsocks-rust/config.json
-Restart=always
-RestartSec=3
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/v2ray -config /usr/local/etc/v2ray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Tạo systemd service cho Shadowsocks local
-cat > /etc/systemd/system/shadowsocks-rust-local.service << EOF
-[Unit]
-Description=Shadowsocks Rust Local
-After=network.target shadowsocks-rust-server.service
-Requires=shadowsocks-rust-server.service
-
-[Service]
-Type=simple
-User=nobody
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-ExecStart=/usr/local/bin/sslocal -c /etc/shadowsocks-rust/local.json
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 #############################################
-# PHẦN 5: CẤU HÌNH TINYPROXY VỚI DNS FIX
+# PHẦN 4: CẤU HÌNH NGINX
 #############################################
 
-echo -e "${GREEN}[5/8] Cấu hình Tinyproxy với DNS cố định...${NC}"
+echo -e "${GREEN}[4/7] Cấu hình và tối ưu Nginx...${NC}"
 
-# Tạo thư mục log nếu chưa tồn tại
-mkdir -p /var/log/tinyproxy
-
-# Cấu hình Tinyproxy
-cat > /etc/tinyproxy/tinyproxy.conf << EOF
-User nobody
-Group nogroup
-Port $HTTP_PROXY_PORT
-Timeout 600
-DefaultErrorFile "/usr/share/tinyproxy/default.html"
-StatFile "/usr/share/tinyproxy/stats.html"
-LogFile "/var/log/tinyproxy/tinyproxy.log"
-LogLevel Info
-PidFile "/run/tinyproxy/tinyproxy.pid"
-MaxClients 1000
-MinSpareServers 5
-MaxSpareServers 20
-StartServers 10
-MaxRequestsPerChild 0
-ViaProxyName "proxy"
-DisableViaHeader Yes
-
-# Cho phép tất cả các kết nối
-Allow 0.0.0.0/0
-
-# Chặn các trang có thể làm lộ IP thật
-Filter "/etc/tinyproxy/filter"
-FilterURLs On
-FilterExtended On
-
-# Kết nối đến localhost qua SOCKS
-Upstream socks5 127.0.0.1:$SOCKS_PORT
-EOF
-
-# Tạo file lọc URL để tránh lộ thông tin
-cat > /etc/tinyproxy/filter << EOF
-# Chặn các trang có thể làm lộ IP thật qua WebRTC hoặc các kỹ thuật khác
-.stun.
-.turn.
-.webrtc-ice.
-.ip-api.
-ipv6-test
-ip6
-ipv6
-.what-is-my-ipv6
-EOF
-
-#############################################
-# PHẦN 6: TRIỂN KHAI IPTABLES ĐỂ TRÁNH RÒ RỈ
-#############################################
-
-echo -e "${GREEN}[6/8] Cấu hình iptables để ngăn rò rỉ kết nối...${NC}"
-
-# Lưu lại các rule hiện tại (nếu có)
-iptables-save > /etc/iptables/rules.v4.backup
-
-# Xóa tất cả các rule hiện tại
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t nat -X
-iptables -t mangle -F
-iptables -t mangle -X
-
-# Thiết lập policy mặc định
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -P OUTPUT ACCEPT
-
-# Cho phép lưu lượng trên loopback
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-
-# Cho phép các kết nối đã thiết lập và liên quan
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# Cho phép SSH
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-
-# Cho phép HTTP/HTTPS
-iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-
-# Cho phép cổng Shadowsocks
-iptables -A INPUT -p tcp --dport $SS_PORT -j ACCEPT
-iptables -A INPUT -p udp --dport $SS_PORT -j ACCEPT
-
-# Cho phép cổng HTTP proxy
-iptables -A INPUT -p tcp --dport $HTTP_PROXY_PORT -j ACCEPT
-
-# Từ chối tất cả các gói tin IPv6 (nếu có)
-ip6tables -P INPUT DROP 2>/dev/null || true
-ip6tables -P FORWARD DROP 2>/dev/null || true
-ip6tables -P OUTPUT DROP 2>/dev/null || true
-
-# Lưu các quy tắc iptables
-iptables-save > /etc/iptables/rules.v4
-if [ -x "$(command -v ip6tables-save)" ]; then
-  ip6tables-save > /etc/iptables/rules.v6
-fi
-
-#############################################
-# PHẦN 7: CẤU HÌNH NGINX VÀ PAC FILE
-#############################################
-
-echo -e "${GREEN}[7/8] Cấu hình Nginx và PAC file đặc biệt...${NC}"
-
-# Cấu hình nginx
+# Tối ưu cấu hình chính của Nginx
 cat > /etc/nginx/nginx.conf << EOF
 user www-data;
 worker_processes auto;
@@ -320,7 +312,7 @@ pid /run/nginx.pid;
 include /etc/nginx/modules-enabled/*.conf;
 
 events {
-    worker_connections 4096;
+    worker_connections 8192;
     multi_accept on;
     use epoll;
 }
@@ -333,6 +325,40 @@ http {
     types_hash_max_size 2048;
     server_tokens off;
     
+    # Tối ưu buffer
+    client_max_body_size 10m;
+    client_body_buffer_size 128k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 4k;
+    
+    # Tối ưu timeouts
+    client_body_timeout 12;
+    client_header_timeout 12;
+    send_timeout 10;
+    
+    # Tối ưu gzip
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_proxied any;
+    gzip_types
+        application/atom+xml
+        application/javascript
+        application/json
+        application/rss+xml
+        application/vnd.ms-fontobject
+        application/x-font-ttf
+        application/x-web-app-manifest+json
+        application/xhtml+xml
+        application/xml
+        font/opentype
+        image/svg+xml
+        image/x-icon
+        text/css
+        text/plain
+        text/x-component;
+    
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     include /etc/nginx/conf.d/*.conf;
@@ -340,17 +366,46 @@ http {
 }
 EOF
 
-# Cấu hình máy chủ Nginx
+# Cấu hình máy chủ Nginx cho V2Ray
 cat > /etc/nginx/sites-available/default << EOF
 server {
     listen 80;
     listen [::]:80;
     server_name $PUBLIC_IP;
     
+    access_log /var/log/nginx/v2ray-access.log;
+    error_log /var/log/nginx/v2ray-error.log;
+    
     # Ngụy trang là một trang web bình thường
     location / {
         root /var/www/html;
-        index index.html check-ip.html;
+        index index.html;
+        
+        # Thêm các HTTP header bảo mật
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    }
+    
+    # Định tuyến WebSocket đến V2Ray
+    location $WS_PATH {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:$WS_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 60s;
+        
+        # Tối ưu proxy buffer
+        proxy_buffer_size 16k;
+        proxy_buffers 8 16k;
+        proxy_busy_buffers_size 32k;
     }
     
     # PAC file cho iPhone
@@ -358,396 +413,76 @@ server {
         root /var/www/html;
         types { } 
         default_type application/x-ns-proxy-autoconfig;
-        add_header Cache-Control "no-cache";
-    }
-
-    # Công cụ kiểm tra IP
-    location /ip {
-        proxy_pass https://ipinfo.io/ip;
-        proxy_set_header Host ipinfo.io;
-        proxy_set_header X-Real-IP \$remote_addr;
-        add_header Content-Type text/plain;
-    }
-    
-    # Công cụ kiểm tra IPv6 (nếu có)
-    location /ipv6 {
-        proxy_pass https://ipv6.icanhazip.com/;
-        proxy_set_header Host ipv6.icanhazip.com;
-        add_header Content-Type text/plain;
-    }
-    
-    # Công cụ kiểm tra leak
-    location /check-leak {
-        proxy_pass https://www.cloudflare.com/cdn-cgi/trace;
-        proxy_set_header Host www.cloudflare.com;
-        add_header Content-Type text/plain;
+        
+        # Thêm cache headers cho PAC file
+        add_header Cache-Control "public, max-age=86400";
     }
 }
 EOF
 
-# Tạo thư mục và PAC file ĐẶC BIỆT
+# Kích hoạt cấu hình Nginx
+ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+
+#############################################
+# PHẦN 5: TẠO PAC FILE VÀ TRANG WEB
+#############################################
+
+echo -e "${GREEN}[5/7] Tạo PAC file và trang web ngụy trang...${NC}"
+
+# Tạo thư mục và PAC file
 mkdir -p /var/www/html/proxy
 cat > /var/www/html/proxy/proxy.pac << EOF
 function FindProxyForURL(url, host) {
-    /* Cải tiến đặc biệt cho iOS để giải quyết vấn đề không thay đổi IP */
-    
-    // Cache busting
-    var randomSuffix = Math.floor(Math.random() * 1000000);
-    
-    // Bỏ qua các địa chỉ IP nội bộ
+    // Tối ưu hiệu suất bằng cache
     if (isPlainHostName(host) || 
+        dnsDomainIs(host, "local") ||
         isInNet(host, "10.0.0.0", "255.0.0.0") ||
         isInNet(host, "172.16.0.0", "255.240.0.0") ||
         isInNet(host, "192.168.0.0", "255.255.0.0") ||
-        isInNet(host, "127.0.0.0", "255.0.0.0") ||
-        dnsDomainIs(host, ".local")) {
+        isInNet(host, "127.0.0.0", "255.0.0.0")) {
         return "DIRECT";
     }
     
-    // Chặn WebRTC leak
-    if (shExpMatch(host, "*.stun.*") ||
-        shExpMatch(host, "stun.*") ||
-        shExpMatch(host, "*.turn.*") ||
-        shExpMatch(host, "turn.*") ||
-        shExpMatch(host, "*global.turn.*") ||
-        shExpMatch(host, "*.googleapis.com") && shExpMatch(url, "*:*")) {
-        return "PROXY 127.0.0.1:1;"; // Block with invalid proxy
+    // Các domain cần dùng proxy
+    var domains = [
+        // Mạng xã hội phổ biến
+        ".facebook.com", ".fbcdn.net",
+        ".twitter.com",
+        ".instagram.com",
+        ".pinterest.com",
+        ".telegram.org",
+        ".t.me",
+        
+        // Google services
+        ".google.com", ".googleapis.com", ".gstatic.com", 
+        ".youtube.com", ".ytimg.com", ".ggpht.com",
+        ".googlevideo.com", ".googleusercontent.com",
+        
+        // Dịch vụ phổ biến khác
+        ".netflix.com", ".nflxvideo.net",
+        ".spotify.com",
+        ".amazon.com",
+        ".twitch.tv",
+        ".reddit.com",
+        
+        // IP/Speed checking
+        ".ipleak.net",
+        ".speedtest.net",
+        ".fast.com"
+    ];
+    
+    // Kiểm tra domain trong danh sách hiệu quả hơn
+    var domain = host.toLowerCase();
+    for (var i = 0; i < domains.length; i++) {
+        if (dnsDomainIs(domain, domains[i]) || 
+            shExpMatch(domain, "*" + domains[i])) {
+            return "PROXY $PUBLIC_IP:$HTTP_PROXY_PORT";
+        }
     }
     
-    // Force qua proxy với tham số random để phá cache
-    return "PROXY $PUBLIC_IP:$HTTP_PROXY_PORT?nocache=" + randomSuffix;
+    // Mặc định truy cập trực tiếp
+    return "DIRECT";
 }
-EOF
-
-# Tạo cấu hình proxy di động đặc biệt
-cat > /var/www/html/proxy/mobile.mobileconfig << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>PayloadContent</key>
-	<array>
-		<dict>
-			<key>PayloadDescription</key>
-			<string>Cấu hình HTTP Proxy tự động</string>
-			<key>PayloadDisplayName</key>
-			<string>HTTP Proxy</string>
-			<key>PayloadIdentifier</key>
-			<string>com.apple.proxy.http.global.${TAG}</string>
-			<key>PayloadType</key>
-			<string>com.apple.proxy.http.global</string>
-			<key>PayloadUUID</key>
-			<string>$(uuidgen)</string>
-			<key>PayloadVersion</key>
-			<integer>1</integer>
-			<key>ProxyCaptiveLoginAllowed</key>
-			<true/>
-			<key>ProxyPACFallbackAllowed</key>
-			<false/>
-			<key>ProxyPACURL</key>
-			<string>http://$PUBLIC_IP/proxy/proxy.pac</string>
-			<key>ProxyType</key>
-			<string>Auto</string>
-		</dict>
-	</array>
-	<key>PayloadDescription</key>
-	<string>Cấu hình proxy tự động cho iOS</string>
-	<key>PayloadDisplayName</key>
-	<string>HTTP Proxy Configuration</string>
-	<key>PayloadIdentifier</key>
-	<string>com.proxy.${TAG}</string>
-	<key>PayloadRemovalDisallowed</key>
-	<false/>
-	<key>PayloadType</key>
-	<string>Configuration</string>
-	<key>PayloadUUID</key>
-	<string>$(uuidgen)</string>
-	<key>PayloadVersion</key>
-	<integer>1</integer>
-</dict>
-</plist>
-EOF
-
-# Tạo trang web kiểm tra toàn diện
-cat > /var/www/html/check-ip.html << EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Kiểm Tra IP Toàn Diện</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta charset="UTF-8">
-    <style>
-        body { font-family: Arial, sans-serif; text-align: center; margin: 20px; line-height: 1.6; }
-        .container { max-width: 800px; margin: 0 auto; }
-        .result-box { background: #f5f5f5; border-radius: 5px; padding: 15px; margin: 20px 0; }
-        .success { color: green; font-weight: bold; }
-        .error { color: red; font-weight: bold; }
-        .warning { color: orange; font-weight: bold; }
-        button { background: #4CAF50; color: white; border: none; padding: 12px 24px; cursor: pointer; border-radius: 4px; font-size: 16px; margin: 10px; }
-        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-        table, th, td { border: 1px solid #ddd; }
-        th, td { padding: 12px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .loader { border: 5px solid #f3f3f3; border-top: 5px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 10px auto; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .test-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        @media (max-width: 600px) { .test-grid { grid-template-columns: 1fr; } }
-        .config-box { background: #e8f4f8; padding: 15px; border-left: 4px solid #4CAF50; margin: 20px 0; text-align: left; }
-        .important { background-color: #ffe6e6; padding: 15px; border-left: 4px solid #ff0000; margin: 20px 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Kiểm Tra HTTP Bridge Toàn Diện</h1>
-        <p>Công cụ này sẽ kiểm tra nhiều khía cạnh của kết nối proxy của bạn</p>
-        
-        <div class="important">
-            <h3>⚠️ Lưu ý quan trọng:</h3>
-            <p><strong>Nếu kết quả kiểm tra vẫn hiển thị IP Việt Nam</strong>, vui lòng thử các biện pháp sau:</p>
-            <ol style="text-align: left;">
-                <li>Tắt và bật lại chế độ máy bay trên iPhone</li>
-                <li>Khởi động lại iPhone</li>
-                <li>Thử cấu hình proxy thủ công thay vì PAC file</li>
-                <li>Tắt mọi VPN khác nếu có</li>
-                <li>Tải và cài đặt <a href="/proxy/mobile.mobileconfig">hồ sơ cấu hình proxy đặc biệt</a></li>
-            </ol>
-        </div>
-        
-        <div class="test-grid">
-            <div>
-                <button onclick="checkIP()">Kiểm tra IP</button>
-                <div id="ip-result" class="result-box">
-                    <p>Nhấn nút để kiểm tra</p>
-                </div>
-            </div>
-            
-            <div>
-                <button onclick="checkIPv6()">Kiểm tra IPv6</button>
-                <div id="ipv6-result" class="result-box">
-                    <p>Nhấn nút để kiểm tra</p>
-                </div>
-            </div>
-            
-            <div>
-                <button onclick="checkDNSLeak()">Kiểm tra DNS Leak</button>
-                <div id="dns-result" class="result-box">
-                    <p>Nhấn nút để kiểm tra</p>
-                </div>
-            </div>
-            
-            <div>
-                <button onclick="checkWebRTC()">Kiểm tra WebRTC Leak</button>
-                <div id="webrtc-result" class="result-box">
-                    <p>Nhấn nút để kiểm tra</p>
-                </div>
-            </div>
-        </div>
-        
-        <button onclick="runAllTests()" style="background-color: #ff9800;">Chạy tất cả kiểm tra</button>
-        
-        <div class="config-box">
-            <h3>Thông tin cấu hình:</h3>
-            <ul style="text-align: left;">
-                <li><strong>HTTP Proxy:</strong> $PUBLIC_IP:$HTTP_PROXY_PORT</li>
-                <li><strong>PAC URL:</strong> http://$PUBLIC_IP/proxy/proxy.pac</li>
-                <li><strong>Cấu hình tự động:</strong> <a href="/proxy/mobile.mobileconfig">Tải hồ sơ cấu hình</a></li>
-            </ul>
-            <p><strong>Trên iPhone:</strong> Vào Settings > Wi-Fi > [Mạng Wi-Fi] > Configure Proxy > Manual</p>
-            <p>Server: $PUBLIC_IP, Port: $HTTP_PROXY_PORT</p>
-        </div>
-    </div>
-    
-    <script>
-        // Kiểm tra IP
-        function checkIP() {
-            const resultDiv = document.getElementById('ip-result');
-            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra IP...</p>';
-            
-            fetch('/ip')
-                .then(response => response.text())
-                .then(data => {
-                    let ipAddress = data.trim();
-                    resultDiv.innerHTML = 
-                        '<p>IP hiện tại của bạn: <strong>' + ipAddress + '</strong></p>';
-                    
-                    // Kiểm tra xem IP có phải là IP Việt Nam không
-                    fetch('https://ipapi.co/' + ipAddress + '/country/')
-                        .then(response => response.text())
-                        .then(country => {
-                            if (country.trim() === 'VN') {
-                                resultDiv.innerHTML += '<p class="error">⛔ IP này vẫn là IP Việt Nam!</p>';
-                                resultDiv.innerHTML += '<p>Vui lòng thử các biện pháp khắc phục trong phần Lưu ý quan trọng.</p>';
-                            } else {
-                                resultDiv.innerHTML += '<p class="success">✅ IP không phải là IP Việt Nam!</p>';
-                                resultDiv.innerHTML += '<p>HTTP Bridge đang hoạt động tốt.</p>';
-                            }
-                        })
-                        .catch(error => {
-                            resultDiv.innerHTML += '<p class="warning">⚠️ Không thể xác định quốc gia của IP</p>';
-                        });
-                })
-                .catch(error => {
-                    resultDiv.innerHTML = '<p class="error">Lỗi khi kiểm tra IP: ' + error + '</p>';
-                });
-        }
-        
-        // Kiểm tra IPv6
-        function checkIPv6() {
-            const resultDiv = document.getElementById('ipv6-result');
-            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra IPv6...</p>';
-            
-            fetch('/ipv6')
-                .then(response => response.text())
-                .then(data => {
-                    if (data.trim() && !data.includes('error') && !data.includes('no ipv6')) {
-                        resultDiv.innerHTML = 
-                            '<p>IPv6 được phát hiện: <strong>' + data.trim() + '</strong></p>' +
-                            '<p class="error">⛔ IPv6 có thể đang rò rỉ kết nối!</p>' +
-                            '<p>Vui lòng tắt IPv6 trên thiết bị của bạn.</p>';
-                    } else {
-                        resultDiv.innerHTML = 
-                            '<p class="success">✅ Không phát hiện IPv6!</p>' +
-                            '<p>Đây là kết quả tốt, tránh được rò rỉ kết nối qua IPv6.</p>';
-                    }
-                })
-                .catch(error => {
-                    resultDiv.innerHTML = 
-                        '<p class="success">✅ Không phát hiện IPv6!</p>' +
-                        '<p>Đây là kết quả tốt, tránh được rò rỉ kết nối qua IPv6.</p>';
-                });
-        }
-        
-        // Kiểm tra DNS leak
-        function checkDNSLeak() {
-            const resultDiv = document.getElementById('dns-result');
-            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra DNS leak...</p>';
-            
-            fetch('/check-leak')
-                .then(response => response.text())
-                .then(data => {
-                    let ip = '';
-                    const lines = data.split('\\n');
-                    for (const line of lines) {
-                        if (line.startsWith('ip=')) {
-                            ip = line.substring(3);
-                            break;
-                        }
-                    }
-                    
-                    if (ip) {
-                        fetch('/ip')
-                            .then(response => response.text())
-                            .then(proxyIp => {
-                                if (ip.trim() === proxyIp.trim()) {
-                                    resultDiv.innerHTML = 
-                                        '<p class="success">✅ DNS không bị rò rỉ!</p>' +
-                                        '<p>IP DNS: <strong>' + ip + '</strong> khớp với IP proxy.</p>';
-                                } else {
-                                    resultDiv.innerHTML = 
-                                        '<p class="error">⛔ DNS có thể đang bị rò rỉ!</p>' +
-                                        '<p>IP DNS: <strong>' + ip + '</strong> không khớp với IP proxy.</p>' +
-                                        '<p>Bạn nên sử dụng cấu hình DNS tùy chỉnh trên iPhone.</p>';
-                                }
-                            });
-                    } else {
-                        resultDiv.innerHTML = '<p class="warning">⚠️ Không thể xác định IP DNS</p>';
-                    }
-                })
-                .catch(error => {
-                    resultDiv.innerHTML = '<p class="error">Lỗi khi kiểm tra DNS: ' + error + '</p>';
-                });
-        }
-        
-        // Kiểm tra WebRTC leak
-        function checkWebRTC() {
-            const resultDiv = document.getElementById('webrtc-result');
-            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra WebRTC leak...</p>';
-            
-            // Hàm kiểm tra WebRTC
-            function getIPs(callback) {
-                var ip_dups = {};
-                var RTCPeerConnection = window.RTCPeerConnection
-                    || window.mozRTCPeerConnection
-                    || window.webkitRTCPeerConnection;
-                
-                if (!RTCPeerConnection) {
-                    resultDiv.innerHTML = '<p class="warning">⚠️ WebRTC không được hỗ trợ trên trình duyệt này</p>';
-                    return;
-                }
-                
-                var pc = new RTCPeerConnection({
-                    iceServers: [{urls: "stun:stun.services.mozilla.com"}]
-                });
-                
-                function handleCandidate(candidate) {
-                    var ip_regex = /([0-9]{1,3}(\.[0-9]{1,3}){3})/;
-                    var ip_addr = ip_regex.exec(candidate);
-                    if (ip_addr) {
-                        var ip = ip_addr[1];
-                        if (ip.substr(0, 7) == '192.168' || ip.substr(0, 7) == '10.0.0.' || ip.substr(0, 3) == '172') {
-                            // Bỏ qua địa chỉ IP cục bộ
-                            return;
-                        }
-                        if (ip_dups[ip] === undefined) {
-                            callback(ip);
-                        }
-                        ip_dups[ip] = true;
-                    }
-                }
-                
-                pc.createDataChannel("");
-                pc.createOffer().then(function(offer) {
-                    return pc.setLocalDescription(offer);
-                }).catch(function(error) {
-                    resultDiv.innerHTML = '<p class="error">Lỗi khi tạo kết nối: ' + error + '</p>';
-                });
-                
-                setTimeout(function() {
-                    if (pc.localDescription) {
-                        var lines = pc.localDescription.sdp.split('\\n');
-                        lines.forEach(function(line) {
-                            if (line.indexOf('candidate') !== -1) {
-                                handleCandidate(line);
-                            }
-                        });
-                    }
-                    
-                    if (Object.keys(ip_dups).length === 0) {
-                        resultDiv.innerHTML = 
-                            '<p class="success">✅ Không phát hiện rò rỉ WebRTC!</p>' +
-                            '<p>WebRTC đã được chặn hoặc không phát hiện IP công khai.</p>';
-                    }
-                }, 1000);
-            }
-            
-            getIPs(function(ip) {
-                fetch('/ip')
-                    .then(response => response.text())
-                    .then(proxyIp => {
-                        if (ip.trim() !== proxyIp.trim()) {
-                            resultDiv.innerHTML = 
-                                '<p class="error">⛔ WebRTC đang làm lộ IP thật của bạn!</p>' +
-                                '<p>IP WebRTC: <strong>' + ip + '</strong> không khớp với IP proxy.</p>' +
-                                '<p>Bạn nên sử dụng trình duyệt có thể vô hiệu hóa WebRTC.</p>';
-                        } else {
-                            resultDiv.innerHTML = 
-                                '<p class="success">✅ WebRTC không làm lộ IP thật!</p>' +
-                                '<p>IP WebRTC: <strong>' + ip + '</strong> khớp với IP proxy.</p>';
-                        }
-                    });
-            });
-        }
-        
-        // Chạy tất cả các kiểm tra
-        function runAllTests() {
-            checkIP();
-            checkIPv6();
-            checkDNSLeak();
-            checkWebRTC();
-        }
-    </script>
-</body>
-</html>
 EOF
 
 # Tạo trang web ngụy trang
@@ -755,51 +490,128 @@ cat > /var/www/html/index.html << EOF
 <!DOCTYPE html>
 <html>
 <head>
-    <title>HTTP Proxy Bridge</title>
+    <title>Secure Data Solutions</title>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 0; line-height: 1.6; }
-        .header { background: linear-gradient(135deg, #007bff, #6610f2); color: white; padding: 40px 0; text-align: center; }
-        .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
-        .card { background: white; border-radius: 5px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 20px 0; padding: 20px; }
-        .button { background: #007bff; color: white; text-decoration: none; padding: 10px 20px; border-radius: 4px; display: inline-block; }
-        .footer { background: #333; color: white; text-align: center; padding: 20px 0; margin-top: 40px; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+            margin: 0; 
+            padding: 0; 
+            line-height: 1.6; 
+            color: #333;
+            background-color: #f8f9fa;
+        }
+        .header { 
+            background: linear-gradient(135deg, #6a11cb, #2575fc);
+            color: white; 
+            text-align: center; 
+            padding: 60px 0; 
+            margin-bottom: 30px;
+        }
+        .container { 
+            max-width: 1000px; 
+            margin: 0 auto; 
+            padding: 0 20px; 
+        }
+        .features {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            margin: 40px 0;
+        }
+        .feature {
+            flex: 0 0 30%;
+            background: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            margin-bottom: 30px;
+        }
+        .feature h3 {
+            color: #2575fc;
+            margin-top: 0;
+        }
+        .cta {
+            background: #f0f0f0;
+            padding: 40px 0;
+            text-align: center;
+            margin: 40px 0;
+        }
+        .button {
+            display: inline-block;
+            background: #6a11cb;
+            color: white;
+            padding: 12px 30px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-weight: bold;
+            margin-top: 20px;
+        }
+        .footer { 
+            background: #333; 
+            color: white; 
+            text-align: center; 
+            padding: 30px 0; 
+            margin-top: 40px; 
+        }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="container">
-            <h1>HTTP Proxy Bridge</h1>
-            <p>Giải pháp proxy an toàn và hiệu quả</p>
+            <h1>SecureData Solutions</h1>
+            <p>Mạng lưới bảo mật hàng đầu cho doanh nghiệp và cá nhân</p>
         </div>
     </div>
     
     <div class="container">
-        <div class="card">
-            <h2>Tính năng</h2>
-            <ul>
-                <li>HTTP Bridge qua proxy bảo mật</li>
-                <li>Bảo vệ khỏi rò rỉ DNS và WebRTC</li>
-                <li>Ngăn chặn theo dõi và giám sát</li>
-                <li>Hiệu suất cao</li>
-            </ul>
-            <a href="/check-ip.html" class="button">Kiểm tra kết nối</a>
+        <h2>Dịch vụ của chúng tôi</h2>
+        <p>SecureData cung cấp giải pháp bảo mật mạng toàn diện với ưu tiên hàng đầu về bảo mật, độ tin cậy và dễ sử dụng.</p>
+        
+        <div class="features">
+            <div class="feature">
+                <h3>Bảo vệ dữ liệu</h3>
+                <p>Mã hóa đầu cuối mạnh mẽ bảo vệ thông tin nhạy cảm của bạn khỏi các mối đe dọa.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>Giải pháp doanh nghiệp</h3>
+                <p>Bảo mật cấp doanh nghiệp với các tính năng bảo mật nâng cao cho tổ chức mọi quy mô.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>Sao lưu & Khôi phục</h3>
+                <p>Giải pháp sao lưu tự động để giữ an toàn dữ liệu quan trọng khỏi mất mát hoặc hỏng hóc.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>Truy cập bảo mật</h3>
+                <p>Truy cập an toàn vào mạng nội bộ và dữ liệu từ bất kỳ đâu trên thế giới.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>Đa nền tảng</h3>
+                <p>Hỗ trợ đầy đủ cho Windows, macOS, iOS, Android và các hệ điều hành Linux.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>Hỗ trợ 24/7</h3>
+                <p>Đội ngũ chuyên gia của chúng tôi luôn sẵn sàng hỗ trợ bạn mọi lúc, mọi nơi.</p>
+            </div>
         </div>
         
-        <div class="card">
-            <h2>Cài đặt cho iPhone/iPad</h2>
-            <p>Để sử dụng proxy này trên thiết bị iOS của bạn:</p>
-            <ol>
-                <li>Tải <a href="/proxy/mobile.mobileconfig">hồ sơ cấu hình</a></li>
-                <li>Cài đặt hồ sơ trong phần Settings</li>
-                <li>Hoặc cấu hình thủ công: Vào Settings > Wi-Fi > [Mạng Wi-Fi của bạn] > Configure Proxy</li>
-            </ol>
+        <div class="cta">
+            <h2>Sẵn sàng bắt đầu?</h2>
+            <p>Tham gia cùng hàng nghìn khách hàng hài lòng đang sử dụng giải pháp bảo mật của SecureData.</p>
+            <a href="#" class="button">Liên hệ với chúng tôi</a>
         </div>
     </div>
     
     <div class="footer">
         <div class="container">
-            <p>&copy; 2025 HTTP Proxy Bridge. All rights reserved.</p>
+            <p>&copy; 2025 SecureData Solutions. Mọi quyền được bảo lưu.</p>
+            <p>Chính sách bảo mật | Điều khoản dịch vụ | Liên hệ</p>
         </div>
     </div>
 </body>
@@ -807,248 +619,400 @@ cat > /var/www/html/index.html << EOF
 EOF
 
 #############################################
-# PHẦN 8: SCRIPT KIỂM TRA VÀ KHỞI ĐỘNG DỊCH VỤ
+# PHẦN 6: TẠO TOOL KIỂM TRA KẾT NỐI
 #############################################
 
-echo -e "${GREEN}[8/8] Tạo script kiểm tra và khởi động dịch vụ...${NC}"
+echo -e "${GREEN}[6/7] Tạo trang kiểm tra kết nối...${NC}"
 
-# Tạo script kiểm tra kết nối
-cat > /usr/local/bin/check-proxy.sh << EOF
+# Tạo trang kiểm tra kết nối
+cat > /var/www/html/check.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kiểm tra kết nối</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        h1, h2 {
+            color: #2575fc;
+        }
+        .status {
+            font-size: 1.1em;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .warning {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        .info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+        }
+        button {
+            background-color: #2575fc;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1em;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        button:hover {
+            background-color: #1a5cbe;
+        }
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0,0,0,0.1);
+            border-radius: 50%;
+            border-top-color: #2575fc;
+            animation: spin 1s ease-in-out infinite;
+            margin-right: 10px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .connection-info {
+            background-color: #e6f3ff;
+            border-left: 4px solid #2575fc;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        code {
+            background-color: #f0f0f0;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <h1>Kiểm tra kết nối proxy</h1>
+    
+    <div class="card">
+        <h2>Thông tin kết nối của bạn</h2>
+        <div class="connection-info">
+            <p><strong>HTTP Proxy:</strong> $PUBLIC_IP:$HTTP_PROXY_PORT</p>
+            <p><strong>PAC URL:</strong> http://$PUBLIC_IP/proxy/proxy.pac</p>
+            <p><strong>Shadowsocks:</strong> $PUBLIC_IP:$SS_PORT (Password: $SS_PASSWORD, Method: $SS_METHOD)</p>
+        </div>
+        
+        <h3>Kiểm tra địa chỉ IP</h3>
+        <button onclick="checkIP()">Kiểm tra IP của tôi</button>
+        <div id="ip-result"></div>
+        
+        <h3>Kiểm tra DNS</h3>
+        <button onclick="checkDNS()">Kiểm tra DNS</button>
+        <div id="dns-result"></div>
+        
+        <h3>Kiểm tra tốc độ kết nối</h3>
+        <button onclick="checkSpeed()">Kiểm tra tốc độ</button>
+        <div id="speed-result"></div>
+    </div>
+    
+    <div class="card">
+        <h2>Hướng dẫn cấu hình</h2>
+        
+        <h3>Cấu hình trên iPhone/iPad</h3>
+        <ol>
+            <li>Vào <strong>Settings</strong> > <strong>Wi-Fi</strong></li>
+            <li>Chọn mạng Wi-Fi hiện tại (nhấn vào biểu tượng (i))</li>
+            <li>Kéo xuống và chọn <strong>Configure Proxy</strong></li>
+            <li>Chọn <strong>Automatic</strong> và nhập URL: <code>http://$PUBLIC_IP/proxy/proxy.pac</code></li>
+            <li>Hoặc chọn <strong>Manual</strong>, nhập <code>$PUBLIC_IP</code> và cổng <code>$HTTP_PROXY_PORT</code></li>
+        </ol>
+        
+        <h3>Cấu hình Shadowsocks</h3>
+        <p>Sử dụng thông tin sau để cấu hình ứng dụng Shadowsocks:</p>
+        <ul>
+            <li>Địa chỉ máy chủ: <code>$PUBLIC_IP</code></li>
+            <li>Cổng: <code>$SS_PORT</code></li>
+            <li>Mật khẩu: <code>$SS_PASSWORD</code></li>
+            <li>Phương thức mã hóa: <code>$SS_METHOD</code></li>
+        </ul>
+    </div>
+    
+    <script>
+        function checkIP() {
+            const resultDiv = document.getElementById('ip-result');
+            resultDiv.innerHTML = '<div class="loading"></div> Đang kiểm tra IP...';
+            
+            fetch('https://api.ipify.org?format=json')
+                .then(response => response.json())
+                .then(data => {
+                    resultDiv.innerHTML = '<div class="status success">IP hiện tại của bạn: <strong>' + data.ip + '</strong></div>';
+                })
+                .catch(error => {
+                    resultDiv.innerHTML = '<div class="status error">Không thể kiểm tra IP: ' + error.message + '</div>';
+                });
+        }
+        
+        function checkDNS() {
+            const resultDiv = document.getElementById('dns-result');
+            resultDiv.innerHTML = '<div class="loading"></div> Đang kiểm tra DNS...';
+            
+            fetch('https://1.1.1.1/cdn-cgi/trace')
+                .then(response => response.text())
+                .then(data => {
+                    const lines = data.split('\\n');
+                    let ip = '';
+                    let location = '';
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('ip=')) {
+                            ip = line.substring(3);
+                        }
+                        if (line.startsWith('loc=')) {
+                            location = line.substring(4);
+                        }
+                    }
+                    
+                    resultDiv.innerHTML = '<div class="status info">DNS resolve thành công!<br>IP: <strong>' + 
+                        ip + '</strong><br>Vị trí: <strong>' + location + '</strong></div>';
+                })
+                .catch(error => {
+                    resultDiv.innerHTML = '<div class="status error">Không thể kiểm tra DNS: ' + error.message + '</div>';
+                });
+        }
+        
+        function checkSpeed() {
+            const resultDiv = document.getElementById('speed-result');
+            resultDiv.innerHTML = '<div class="loading"></div> Đang kiểm tra tốc độ kết nối...';
+            
+            const startTime = new Date().getTime();
+            const imageSize = 2097152; // 2MB image
+            
+            fetch('https://speed.cloudflare.com/__down?bytes=2097152')
+                .then(response => {
+                    const endTime = new Date().getTime();
+                    const duration = (endTime - startTime) / 1000;
+                    const speed = ((imageSize * 8) / duration) / 1000000;
+                    
+                    resultDiv.innerHTML = '<div class="status success">Tốc độ tải xuống: <strong>' + 
+                        speed.toFixed(2) + ' Mbps</strong></div>';
+                })
+                .catch(error => {
+                    resultDiv.innerHTML = '<div class="status error">Không thể kiểm tra tốc độ: ' + error.message + '</div>';
+                });
+        }
+    </script>
+</body>
+</html>
+EOF
+
+#############################################
+# PHẦN 7: TẠO SCRIPT BẢO TRÌ VÀ KHỞI ĐỘNG DỊCH VỤ
+#############################################
+
+echo -e "${GREEN}[7/7] Tạo script bảo trì và khởi động dịch vụ...${NC}"
+
+# Tạo script giám sát
+cat > /usr/local/bin/monitor-proxy.sh << EOF
 #!/bin/bash
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${YELLOW}====== KIỂM TRA PROXY TOÀN DIỆN ======${NC}"
+echo -e "\${YELLOW}Kiểm tra tài nguyên hệ thống:${NC}"
+echo -e "CPU: \$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - \$1}')% đang sử dụng"
+echo -e "RAM: \$(free -m | awk 'NR==2{printf "%.2f%%", \$3*100/\$2}')"
+echo -e "SWAP: \$(free -m | awk 'NR==3{printf "%.2f%%", \$3*100/\$2}')"
+echo -e "Dung lượng: \$(df -h / | awk 'NR==2{print \$5}')"
 
-# Kiểm tra dịch vụ
-echo -e "\n${YELLOW}Kiểm tra trạng thái dịch vụ:${NC}"
-systemctl status tinyproxy --no-pager | grep Active || echo -e "${RED}Tinyproxy không chạy!${NC}"
-systemctl status shadowsocks-rust-server --no-pager | grep Active || echo -e "${RED}Shadowsocks-server không chạy!${NC}"
-systemctl status shadowsocks-rust-local --no-pager | grep Active || echo -e "${RED}Shadowsocks-local không chạy!${NC}"
-systemctl status nginx --no-pager | grep Active || echo -e "${RED}Nginx không chạy!${NC}"
+echo -e "\${YELLOW}Kiểm tra dịch vụ:${NC}"
+for service in v2ray nginx; do
+  if systemctl is-active --quiet \$service; then
+    echo -e "\${GREEN}\$service: đang chạy${NC}"
+  else
+    echo -e "\${RED}\$service: không chạy${NC}"
+    systemctl restart \$service
+    echo -e "Đã cố gắng khởi động lại \$service"
+  fi
+done
 
-# Kiểm tra các cổng đang lắng nghe
-echo -e "\n${YELLOW}Cổng đang lắng nghe:${NC}"
-netstat -tuln | grep -E "$HTTP_PROXY_PORT|$SOCKS_PORT|$SS_PORT|80" || echo -e "${RED}Không tìm thấy cổng nào!${NC}"
+echo -e "\${YELLOW}Thống kê kết nối:${NC}"
+echo "Kết nối HTTP Proxy:"
+netstat -anp | grep :$HTTP_PROXY_PORT | wc -l
+echo "Kết nối WebSocket:"
+netstat -anp | grep :$WS_PORT | wc -l
+echo "Kết nối Shadowsocks:"
+netstat -anp | grep :$SS_PORT | wc -l
 
-# Kiểm tra IPv6
-echo -e "\n${YELLOW}Kiểm tra IPv6:${NC}"
-if [[ \$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -eq 1 ]]; then
-    echo -e "${GREEN}IPv6 đã bị vô hiệu hóa.${NC}"
-else
-    echo -e "${RED}IPv6 chưa bị vô hiệu hóa!${NC}"
-    echo -e "${YELLOW}Thực hiện vô hiệu hóa IPv6...${NC}"
-    echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-    echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6
-    echo 1 > /proc/sys/net/ipv6/conf/lo/disable_ipv6
+echo -e "\${YELLOW}Kiểm tra kết nối:${NC}"
+curl -s -x http://localhost:$HTTP_PROXY_PORT -o /dev/null -w "HTTP Proxy: %{http_code}\n" https://www.google.com
+
+echo -e "\${YELLOW}Kiểm tra log lỗi:${NC}"
+tail -n 10 /var/log/v2ray/error.log
+
+# Kiểm tra và khởi động lại nếu có lỗi
+error_count=\$(grep -c "error" /var/log/v2ray/error.log 2>/dev/null)
+if [ \$error_count -gt 10 ]; then
+    echo -e "\${RED}Phát hiện quá nhiều lỗi trong log V2Ray, khởi động lại...${NC}"
+    systemctl restart v2ray
 fi
-
-# Kiểm tra kết nối HTTP proxy
-echo -e "\n${YELLOW}Kiểm tra kết nối HTTP proxy:${NC}"
-curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip || echo -e "${RED}HTTP proxy không hoạt động!${NC}"
-
-# Kiểm tra kết nối SOCKS proxy
-echo -e "\n${YELLOW}Kiểm tra kết nối SOCKS proxy:${NC}"
-curl -s --socks5 127.0.0.1:$SOCKS_PORT https://ipinfo.io/ip || echo -e "${RED}SOCKS proxy không hoạt động!${NC}"
-
-# Kiểm tra kết nối trực tiếp để so sánh
-echo -e "\n${YELLOW}Kiểm tra IP trực tiếp (không qua proxy):${NC}"
-curl -s https://ipinfo.io/ip
-
-echo -e "\n${YELLOW}Kết luận:${NC}"
-IP_PROXY=\$(curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip)
-IP_DIRECT=\$(curl -s https://ipinfo.io/ip)
-
-if [ "\$IP_PROXY" = "\$IP_DIRECT" ]; then
-  echo -e "${RED}CHÚ Ý: IP qua proxy và IP trực tiếp GIỐNG NHAU! Proxy không hoạt động đúng cách!${NC}"
-else
-  echo -e "${GREEN}IP qua proxy và IP trực tiếp KHÁC NHAU. Proxy đang hoạt động tốt!${NC}"
-fi
-
-# Kiểm tra DNS của proxy
-echo -e "\n${YELLOW}Kiểm tra DNS qua proxy:${NC}"
-curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://google.com > /dev/null
-if [ \$? -eq 0 ]; then
-    echo -e "${GREEN}DNS qua proxy hoạt động tốt.${NC}"
-else
-    echo -e "${RED}DNS qua proxy không hoạt động!${NC}"
-fi
-
-# Kiểm tra tốc độ proxy
-echo -e "\n${YELLOW}Kiểm tra tốc độ proxy (10MB):${NC}"
-time curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://speed.hetzner.de/10MB.bin -o /dev/null || echo -e "${RED}Kiểm tra tốc độ thất bại!${NC}"
 EOF
-chmod +x /usr/local/bin/check-proxy.sh
+chmod +x /usr/local/bin/monitor-proxy.sh
 
-# Tạo script khởi động lại
+# Tạo script khởi động lại dịch vụ
 cat > /usr/local/bin/restart-proxy.sh << EOF
 #!/bin/bash
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-echo -e "\${GREEN}Khởi động lại tất cả dịch vụ proxy...${NC}"
-systemctl restart tinyproxy
-systemctl restart shadowsocks-rust-server
-systemctl restart shadowsocks-rust-local
+systemctl restart v2ray
 systemctl restart nginx
-echo -e "\${GREEN}Đã khởi động lại dịch vụ.${NC}"
+echo "Tất cả dịch vụ đã được khởi động lại"
 EOF
 chmod +x /usr/local/bin/restart-proxy.sh
 
-# Tạo script sửa tự động
-cat > /usr/local/bin/auto-fix-proxy.sh << EOF
+# Tạo script cập nhật tự động
+cat > /usr/local/bin/update-proxy.sh << EOF
 #!/bin/bash
-LOG="/var/log/proxy-check.log"
-echo "Kiểm tra proxy tự động lúc \$(date)" >> \$LOG
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-# Đảm bảo IPv6 bị vô hiệu hóa
-echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6
-echo 1 > /proc/sys/net/ipv6/conf/lo/disable_ipv6
+echo -e "\${GREEN}Đang cập nhật hệ thống...${NC}"
+apt update && apt upgrade -y
 
-# Đảm bảo /etc/resolv.conf không bị thay đổi
-cat > /etc/resolv.conf << EOFDNS
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOFDNS
-chattr +i /etc/resolv.conf
+echo -e "\${GREEN}Đang cập nhật V2Ray...${NC}"
+systemctl stop v2ray
+bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)
 
-# Kiểm tra HTTP proxy
-if ! curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://www.google.com -o /dev/null; then
-    echo "HTTP proxy không hoạt động, khởi động lại Tinyproxy" >> \$LOG
-    systemctl restart tinyproxy
-fi
-
-# Kiểm tra SOCKS proxy
-if ! curl -s --socks5 127.0.0.1:$SOCKS_PORT https://www.google.com -o /dev/null; then
-    echo "SOCKS proxy không hoạt động, khởi động lại Shadowsocks" >> \$LOG
-    systemctl restart shadowsocks-rust-server
-    systemctl restart shadowsocks-rust-local
-fi
-
-# Kiểm tra Nginx
-if ! curl -s http://127.0.0.1 -o /dev/null; then
-    echo "Nginx không hoạt động, khởi động lại" >> \$LOG
-    systemctl restart nginx
-fi
-
-# Kiểm tra kết nối sau khi sửa
-if curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://www.google.com -o /dev/null; then
-    echo "Kiểm tra OK: HTTP proxy hoạt động" >> \$LOG
-else
-    echo "QUAN TRỌNG: HTTP proxy vẫn không hoạt động sau khi khởi động lại" >> \$LOG
-    /usr/local/bin/restart-proxy.sh >> \$LOG
-fi
-
-# Kiểm tra đặc biệt xem proxy có bị leak không
-IP_PROXY=\$(curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip)
-IP_DIRECT=\$(curl -s https://ipinfo.io/ip)
-
-if [ "\$IP_PROXY" = "\$IP_DIRECT" ]; then
-    echo "NGHIÊM TRỌNG: Proxy bị leak IP! IP qua proxy và IP trực tiếp GIỐNG NHAU!" >> \$LOG
-    echo "Đang thực hiện khởi động lại toàn bộ dịch vụ..." >> \$LOG
-    /usr/local/bin/restart-proxy.sh >> \$LOG
-else
-    echo "OK: IP qua proxy và IP trực tiếp khác nhau" >> \$LOG
-fi
-EOF
-chmod +x /usr/local/bin/auto-fix-proxy.sh
-
-# Thiết lập định kỳ kiểm tra và khởi động lại
-(crontab -l 2>/dev/null || echo "") | {
-    cat
-    echo "*/3 * * * * /usr/local/bin/auto-fix-proxy.sh > /dev/null 2>&1" # Kiểm tra và sửa mỗi 3 phút
-    echo "0 */2 * * * /usr/local/bin/restart-proxy.sh > /dev/null 2>&1"  # Khởi động lại mỗi 2 giờ
-} | crontab -
-
-# Khởi động dịch vụ
+echo -e "\${GREEN}Khởi động lại dịch vụ...${NC}"
 systemctl daemon-reload
-systemctl enable tinyproxy
-systemctl enable shadowsocks-rust-server
-systemctl enable shadowsocks-rust-local
-systemctl enable nginx
-systemctl restart tinyproxy
-systemctl restart shadowsocks-rust-server
-systemctl restart shadowsocks-rust-local
+systemctl restart v2ray
 systemctl restart nginx
 
-# Khởi động iptables
-if [ -f "/etc/iptables/rules.v4" ]; then
-    iptables-restore < /etc/iptables/rules.v4
-fi
+echo -e "\${GREEN}Cập nhật hoàn tất${NC}"
+EOF
+chmod +x /usr/local/bin/update-proxy.sh
 
-# Chờ dịch vụ khởi động
-sleep 5
+# Tự động khởi động lại dịch vụ mỗi ngày
+(crontab -l 2>/dev/null || echo "") | {
+    cat
+    echo "0 4 * * * /usr/local/bin/restart-proxy.sh > /dev/null 2>&1"
+    echo "0 */6 * * * /usr/local/bin/monitor-proxy.sh > /var/log/proxy-monitor.log 2>&1"
+} | crontab -
 
-# Kiểm tra kết nối proxy
-IP_PROXY=$(curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip)
-IP_DIRECT=$(curl -s https://ipinfo.io/ip)
+# Thay đổi quyền sở hữu
+chown -R nobody:nogroup /var/log/v2ray/
+chmod 755 /var/log/v2ray/
 
-# Hiển thị thông tin kết nối
-echo -e "\n${BLUE}========================================================${NC}"
-echo -e "${GREEN}KHẮC PHỤC TRIỆT ĐỂ HTTP BRIDGE ĐÃ HOÀN TẤT${NC}"
-echo -e "${BLUE}========================================================${NC}"
-
-echo -e "\n${YELLOW}THÔNG TIN KẾT NỐI CHO IPHONE:${NC}"
-echo -e "${GREEN}PHƯƠNG ÁN 1: CẤU HÌNH THỦ CÔNG (Khuyến nghị)${NC}"
-echo -e "1. Vào Settings > Wi-Fi > [Mạng Wi-Fi] > Configure Proxy > Manual"
-echo -e "2. Server: ${GREEN}$PUBLIC_IP${NC}"
-echo -e "3. Port: ${GREEN}$HTTP_PROXY_PORT${NC}"
-
-echo -e "\n${GREEN}PHƯƠNG ÁN 2: HỒ SƠ CẤU HÌNH${NC}"
-echo -e "1. Mở Safari trên iPhone và truy cập: ${GREEN}http://$PUBLIC_IP/proxy/mobile.mobileconfig${NC}"
-echo -e "2. Cài đặt hồ sơ cấu hình và tin cậy"
-
-echo -e "\n${GREEN}PHƯƠNG ÁN 3: PAC FILE${NC}"
-echo -e "1. Vào Settings > Wi-Fi > [Mạng Wi-Fi] > Configure Proxy > Auto"
-echo -e "2. URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
-
-echo -e "\n${YELLOW}KIỂM TRA KẾT NỐI:${NC}"
-if [ "$IP_PROXY" = "$IP_DIRECT" ]; then
-  echo -e "${RED}CHÚ Ý: IP qua proxy và IP trực tiếp GIỐNG NHAU!${NC}"
-  echo -e "${YELLOW}Vui lòng thử khởi động lại dịch vụ:${NC} sudo /usr/local/bin/restart-proxy.sh"
-else
-  echo -e "${GREEN}IP qua proxy: $IP_PROXY${NC}"
-  echo -e "${GREEN}IP trực tiếp: $IP_DIRECT${NC}"
-  echo -e "${GREEN}HTTP Bridge đang hoạt động tốt!${NC}"
-fi
-
-echo -e "\n${YELLOW}THÔNG TIN SHADOWSOCKS (nếu muốn kết nối trực tiếp):${NC}"
-echo -e "Server: ${GREEN}$PUBLIC_IP${NC}"
-echo -e "Port: ${GREEN}$SS_PORT${NC}"
-echo -e "Password: ${GREEN}$SS_PASSWORD${NC}"
-echo -e "Method: ${GREEN}$SS_METHOD${NC}"
-
-echo -e "\n${YELLOW}MẸO QUAN TRỌNG KHẮC PHỤC:${NC}"
-echo -e "1. ${GREEN}Tắt và bật lại chế độ máy bay${NC} trên iPhone"
-echo -e "2. ${GREEN}Khởi động lại iPhone${NC} sau khi cấu hình proxy"
-echo -e "3. ${GREEN}Thử cấu hình THỦ CÔNG${NC} thay vì PAC file"
-echo -e "4. ${GREEN}Tắt mọi VPN khác${NC} nếu có"
-echo -e "5. ${GREEN}Sử dụng trang kiểm tra toàn diện${NC}: http://$PUBLIC_IP/check-ip.html"
-
-echo -e "\n${YELLOW}QUẢN LÝ HỆ THỐNG:${NC}"
-echo -e "Kiểm tra: ${GREEN}sudo /usr/local/bin/check-proxy.sh${NC}"
-echo -e "Khởi động lại: ${GREEN}sudo /usr/local/bin/restart-proxy.sh${NC}"
-echo -e "${BLUE}========================================================${NC}"
+# Khởi động dịch vụ
+echo -e "${GREEN}Khởi động dịch vụ...${NC}"
+systemctl daemon-reload
+systemctl enable v2ray
+systemctl enable nginx
+systemctl restart v2ray
+systemctl restart nginx
 
 # Lưu thông tin cấu hình
-mkdir -p /etc/proxy-setup
-cat > /etc/proxy-setup/config.json << EOF
+mkdir -p /etc/v2ray-setup
+cat > /etc/v2ray-setup/config.json << EOF
 {
   "http_proxy_port": $HTTP_PROXY_PORT,
-  "socks_port": $SOCKS_PORT,
-  "shadowsocks_port": $SS_PORT,
-  "shadowsocks_password": "$SS_PASSWORD",
-  "shadowsocks_method": "$SS_METHOD",
+  "ss_port": $SS_PORT,
+  "ss_password": "$SS_PASSWORD",
+  "ss_method": "$SS_METHOD",
+  "ws_port": $WS_PORT,
+  "uuid": "$UUID",
+  "ws_path": "$WS_PATH",
   "public_ip": "$PUBLIC_IP",
   "installation_date": "$(date)",
-  "version": "2.0.0-ultimate-fix"
+  "note": "Cấu hình HTTP - Shadowsocks Bridge với 2GB RAM ảo"
 }
 EOF
-chmod 600 /etc/proxy-setup/config.json
+chmod 600 /etc/v2ray-setup/config.json
 
-# Chạy kiểm tra chi tiết
-echo -e "\n${YELLOW}Đang chạy kiểm tra chi tiết để xác minh cài đặt:${NC}"
-/usr/local/bin/check-proxy.sh
+# Tạo URL chia sẻ V2Ray
+V2RAY_CONFIG=$(cat <<EOF
+{
+  "v": "2",
+  "ps": "V2Ray-WebSocket-SS-Bridge",
+  "add": "$PUBLIC_IP",
+  "port": "80",
+  "id": "$UUID",
+  "aid": "0",
+  "net": "ws",
+  "type": "none",
+  "host": "$PUBLIC_IP",
+  "path": "$WS_PATH",
+  "tls": ""
+}
+EOF
+)
+
+# Mã hóa cấu hình để tạo URL
+V2RAY_LINK="vmess://$(echo $V2RAY_CONFIG | jq -c . | base64 -w 0)"
+
+# Tạo link cấu hình Shadowsocks
+SS_URI="ss://$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)@${PUBLIC_IP}:${SS_PORT}"
+
+echo -e "\n${BLUE}========================================================${NC}"
+echo -e "${GREEN}CÀI ĐẶT THÀNH CÔNG! HỆ THỐNG ĐÃ ĐƯỢC TỐI ƯU HÓA${NC}"
+echo -e "${BLUE}========================================================${NC}"
+
+echo -e "\n${YELLOW}THÔNG TIN KẾT NỐI:${NC}"
+echo -e "HTTP Proxy: ${GREEN}$PUBLIC_IP:$HTTP_PROXY_PORT${NC}"
+echo -e "Shadowsocks: ${GREEN}$PUBLIC_IP:$SS_PORT${NC}"
+echo -e "Shadowsocks Password: ${GREEN}$SS_PASSWORD${NC}"
+echo -e "Shadowsocks Method: ${GREEN}$SS_METHOD${NC}"
+echo -e "V2Ray WebSocket: ${GREEN}http://$PUBLIC_IP:80$WS_PATH${NC}"
+echo -e "UUID: ${GREEN}$UUID${NC}"
+echo -e "PAC URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
+
+echo -e "\n${YELLOW}URL CHIA SẺ:${NC}"
+echo -e "V2Ray Link: ${GREEN}$V2RAY_LINK${NC}"
+echo -e "Shadowsocks URI: ${GREEN}$SS_URI${NC}"
+
+echo -e "\n${YELLOW}HƯỚNG DẪN SỬ DỤNG TRÊN IPHONE:${NC}"
+echo -e "1. Vào Settings > Wi-Fi > [Mạng Wi-Fi] > Configure Proxy > Auto"
+echo -e "2. URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
+echo -e "3. Hoặc cấu hình thủ công: Proxy: ${GREEN}$PUBLIC_IP${NC} Port: ${GREEN}$HTTP_PROXY_PORT${NC}"
+
+echo -e "\n${YELLOW}TRANG KIỂM TRA:${NC}"
+echo -e "URL: ${GREEN}http://$PUBLIC_IP/check.html${NC}"
+
+echo -e "\n${YELLOW}QUẢN LÝ HỆ THỐNG:${NC}"
+echo -e "Giám sát: ${GREEN}sudo /usr/local/bin/monitor-proxy.sh${NC}"
+echo -e "Khởi động lại: ${GREEN}sudo /usr/local/bin/restart-proxy.sh${NC}"
+echo -e "Cập nhật: ${GREEN}sudo /usr/local/bin/update-proxy.sh${NC}"
+
+echo -e "\n${GREEN}RAM ảo 2GB và tối ưu hóa hệ thống đã được thiết lập!${NC}"
+echo -e "${BLUE}========================================================${NC}"
+
+# Kiểm tra trạng thái dịch vụ
+sleep 3
+echo -e "\n${YELLOW}Kiểm tra trạng thái dịch vụ:${NC}"
+systemctl status v2ray --no-pager | grep Active || echo "V2Ray không chạy!"
+systemctl status nginx --no-pager | grep Active || echo "Nginx không chạy!"
