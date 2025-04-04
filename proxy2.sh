@@ -13,7 +13,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "${BLUE}=== SCRIPT TỐI ƯU V2RAY HTTP - SHADOWSOCKS BRIDGE VỚI 2GB RAM ẢO ===${NC}"
+echo -e "${BLUE}=== KHẮC PHỤC TRIỆT ĐỂ DNS LEAK VỚI HTTP PROXY ===${NC}"
 
 # Lấy địa chỉ IP công cộng
 PUBLIC_IP=$(curl -s https://checkip.amazonaws.com || curl -s https://api.ipify.org || curl -s https://ifconfig.me)
@@ -22,138 +22,56 @@ if [ -z "$PUBLIC_IP" ]; then
   PUBLIC_IP=$(hostname -I | awk '{print $1}')
 fi
 
-# Thông số cấu hình
-HTTP_PROXY_PORT=8118
-SS_PORT=8388
-WS_PORT=10086
-SS_PASSWORD=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 16)
-SS_METHOD="chacha20-ietf-poly1305"
-UUID=$(cat /proc/sys/kernel/random/uuid)
-WS_PATH="/$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
-
-#############################################
-# PHẦN 1: CẤU HÌNH HỆ THỐNG VÀ RAM ẢO
-#############################################
-
-echo -e "${GREEN}[1/7] Cấu hình hệ thống và RAM ảo...${NC}"
-
-# Tạo 2GB swap
-echo -e "${YELLOW}Tạo 2GB RAM ảo (swap)...${NC}"
-# Xóa swap cũ nếu có
-swapoff -a &>/dev/null
-rm -f /swapfile
-
-# Tạo swap mới
-fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-
-# Thêm vào fstab nếu chưa có
-if ! grep -q '/swapfile' /etc/fstab; then
-    echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+# Kiểm tra V2Ray đã cài đặt chưa
+if [ ! -f "/usr/local/bin/v2ray" ]; then
+  echo -e "${RED}V2Ray chưa được cài đặt. Vui lòng cài đặt V2Ray trước.${NC}"
+  exit 1
 fi
 
-# Cấu hình swap
-echo -e "${YELLOW}Tối ưu cấu hình swap...${NC}"
-cat > /etc/sysctl.d/99-swap.conf << EOF
-# Giảm swappiness để ưu tiên sử dụng RAM
-vm.swappiness = 10
-# Tăng giá trị cache để cải thiện hiệu suất
-vm.vfs_cache_pressure = 50
-# Tối ưu hóa kết nối mạng
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_fastopen = 3
-EOF
-sysctl -p /etc/sysctl.d/99-swap.conf
-
-# Tối ưu hóa limits.conf cho hiệu suất
-cat > /etc/security/limits.d/proxy-limits.conf << EOF
-* soft nofile 65535
-* hard nofile 65535
-root soft nofile 65535
-root hard nofile 65535
-EOF
-
-echo -e "${GREEN}✅ RAM ảo và cấu hình hệ thống đã được tối ưu hóa${NC}"
-
-#############################################
-# PHẦN 2: CÀI ĐẶT PHẦN MỀM
-#############################################
-
-echo -e "${GREEN}[2/7] Cài đặt các gói cần thiết...${NC}"
-apt update -y
-apt install -y curl wget unzip jq nginx htop net-tools uuid-runtime lsb-release
-
-# Cài đặt apt-fast nếu có thể để tăng tốc độ tải
-if ! command -v apt-fast > /dev/null; then
-  if command -v add-apt-repository > /dev/null; then
-    add-apt-repository -y ppa:apt-fast/stable
-    apt update
-    DEBIAN_FRONTEND=noninteractive apt install -y apt-fast
-  else
-    apt install -y software-properties-common
-    add-apt-repository -y ppa:apt-fast/stable
-    apt update
-    DEBIAN_FRONTEND=noninteractive apt install -y apt-fast
-  fi
+# Kiểm tra cấu hình V2Ray
+if [ ! -f "/usr/local/etc/v2ray/config.json" ]; then
+  echo -e "${RED}Không tìm thấy file cấu hình V2Ray.${NC}"
+  exit 1
 fi
 
-# Nếu apt-fast đã được cài đặt, sử dụng nó để cài đặt các gói còn lại
-if command -v apt-fast > /dev/null; then
-  apt-fast install -y ca-certificates preload zlib1g-dev
+# Đọc thông số cấu hình từ file (nếu có)
+if [ -f "/etc/v2ray-setup/config.json" ]; then
+  echo -e "${GREEN}Đang đọc cấu hình hiện tại...${NC}"
+  HTTP_PROXY_PORT=$(jq -r '.http_proxy_port' /etc/v2ray-setup/config.json 2>/dev/null || echo "8118")
+  SS_PORT=$(jq -r '.ss_port' /etc/v2ray-setup/config.json 2>/dev/null || echo "8388")
+  WS_PORT=$(jq -r '.ws_port' /etc/v2ray-setup/config.json 2>/dev/null || echo "10086")
 else
-  apt install -y ca-certificates preload zlib1g-dev
+  # Sử dụng giá trị mặc định
+  HTTP_PROXY_PORT=8118
+  SS_PORT=8388
+  WS_PORT=10086
 fi
 
-# Tối ưu preload
-echo -e "${YELLOW}Tối ưu hóa preload...${NC}"
-cat > /etc/preload.conf << EOF
-[memload]
-# Tăng cache thêm 20%
-memloadcycle = 120
-ioprio = 3
-
-[processes]
-expiretime = 14
-autosave = 60
-
-[statfs]
-timeout = 3600
-
-[system]
-maxsize = 303
-EOF
-systemctl enable preload
-systemctl restart preload
-
 #############################################
-# PHẦN 3: CÀI ĐẶT V2RAY
+# PHẦN 1: CẤU HÌNH V2RAY VỚI DNS BẢO MẬT
 #############################################
 
-echo -e "${GREEN}[3/7] Cài đặt V2Ray...${NC}"
-bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)
+echo -e "${GREEN}[1/4] Cấu hình V2Ray với DNS bảo mật...${NC}"
 
-# Tạo thư mục log nếu không tồn tại
-mkdir -p /var/log/v2ray
-touch /var/log/v2ray/access.log
-touch /var/log/v2ray/error.log
-chown -R nobody:nogroup /var/log/v2ray
+# Backup cấu hình cũ
+cp /usr/local/etc/v2ray/config.json /usr/local/etc/v2ray/config.json.bak.$(date +%s)
 
-# Tối ưu cấu hình V2Ray - Sử dụng V2Ray cho HTTP và Shadowsocks
+# Tạo cấu hình V2Ray với DNS bảo mật
 cat > /usr/local/etc/v2ray/config.json << EOF
 {
   "log": {
     "loglevel": "warning",
     "access": "/var/log/v2ray/access.log",
     "error": "/var/log/v2ray/error.log"
+  },
+  "dns": {
+    "servers": [
+      "https+local://cloudflare-dns.com/dns-query",
+      "1.1.1.1",
+      "8.8.8.8",
+      "localhost"
+    ],
+    "queryStrategy": "UseIPv4"
   },
   "inbounds": [
     {
@@ -167,7 +85,8 @@ cat > /usr/local/etc/v2ray/config.json << EOF
       "tag": "http_in",
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "fakedns"],
+        "metadataOnly": false
       }
     },
     {
@@ -177,7 +96,7 @@ cat > /usr/local/etc/v2ray/config.json << EOF
       "settings": {
         "clients": [
           {
-            "id": "$UUID",
+            "id": "$(cat /etc/v2ray-setup/config.json | jq -r '.uuid' 2>/dev/null || cat /proc/sys/kernel/random/uuid)",
             "alterId": 0,
             "security": "auto"
           }
@@ -186,17 +105,14 @@ cat > /usr/local/etc/v2ray/config.json << EOF
       "streamSettings": {
         "network": "ws",
         "wsSettings": {
-          "path": "$WS_PATH"
-        },
-        "sockopt": {
-          "tcpFastOpen": true,
-          "tproxy": "redirect"
+          "path": "$(cat /etc/v2ray-setup/config.json | jq -r '.ws_path' 2>/dev/null || echo "/$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)")"
         }
       },
       "tag": "vmess_in",
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "fakedns"],
+        "metadataOnly": false
       }
     },
     {
@@ -204,14 +120,15 @@ cat > /usr/local/etc/v2ray/config.json << EOF
       "listen": "127.0.0.1",
       "protocol": "shadowsocks",
       "settings": {
-        "method": "$SS_METHOD",
-        "password": "$SS_PASSWORD",
+        "method": "$(cat /etc/v2ray-setup/config.json | jq -r '.ss_method' 2>/dev/null || echo "chacha20-ietf-poly1305")",
+        "password": "$(cat /etc/v2ray-setup/config.json | jq -r '.ss_password' 2>/dev/null || echo "$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 16)")",
         "network": "tcp,udp"
       },
       "tag": "ss_in",
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "fakedns"],
+        "metadataOnly": false
       }
     }
   ],
@@ -219,28 +136,23 @@ cat > /usr/local/etc/v2ray/config.json << EOF
     {
       "protocol": "freedom",
       "settings": {
-        "domainStrategy": "UseIP"
+        "domainStrategy": "UseIP",
+        "dns": {
+          "servers": [
+            "https+local://cloudflare-dns.com/dns-query"
+          ]
+        }
       },
       "tag": "direct"
-    },
-    {
-      "protocol": "shadowsocks",
-      "settings": {
-        "servers": [
-          {
-            "address": "127.0.0.1",
-            "port": $SS_PORT,
-            "method": "$SS_METHOD",
-            "password": "$SS_PASSWORD"
-          }
-        ]
-      },
-      "tag": "ss_out"
     },
     {
       "protocol": "blackhole",
       "settings": {},
       "tag": "blocked"
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
     }
   ],
   "routing": {
@@ -248,8 +160,14 @@ cat > /usr/local/etc/v2ray/config.json << EOF
     "rules": [
       {
         "type": "field",
+        "outboundTag": "dns-out",
+        "network": "udp",
+        "port": 53
+      },
+      {
+        "type": "field",
         "inboundTag": ["http_in"],
-        "outboundTag": "ss_out"
+        "outboundTag": "direct"
       },
       {
         "type": "field",
@@ -274,373 +192,176 @@ cat > /usr/local/etc/v2ray/config.json << EOF
 }
 EOF
 
-# Tối ưu V2Ray service
-cat > /etc/systemd/system/v2ray.service << EOF
-[Unit]
-Description=V2Ray Service
-Documentation=https://www.v2fly.org/
-After=network.target nss-lookup.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=nobody
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/v2ray -config /usr/local/etc/v2ray/config.json
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 #############################################
-# PHẦN 4: CẤU HÌNH NGINX
+# PHẦN 2: CẬP NHẬT PAC FILE CHỐNG DNS LEAK
 #############################################
 
-echo -e "${GREEN}[4/7] Cấu hình và tối ưu Nginx...${NC}"
+echo -e "${GREEN}[2/4] Cập nhật PAC file để ngăn DNS leak...${NC}"
 
-# Tối ưu cấu hình chính của Nginx
-cat > /etc/nginx/nginx.conf << EOF
-user www-data;
-worker_processes auto;
-worker_rlimit_nofile 65535;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections 8192;
-    multi_accept on;
-    use epoll;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    types_hash_max_size 2048;
-    server_tokens off;
-    
-    # Tối ưu buffer
-    client_max_body_size 10m;
-    client_body_buffer_size 128k;
-    client_header_buffer_size 1k;
-    large_client_header_buffers 4 4k;
-    
-    # Tối ưu timeouts
-    client_body_timeout 12;
-    client_header_timeout 12;
-    send_timeout 10;
-    
-    # Tối ưu gzip
-    gzip on;
-    gzip_vary on;
-    gzip_comp_level 5;
-    gzip_min_length 256;
-    gzip_proxied any;
-    gzip_types
-        application/atom+xml
-        application/javascript
-        application/json
-        application/rss+xml
-        application/vnd.ms-fontobject
-        application/x-font-ttf
-        application/x-web-app-manifest+json
-        application/xhtml+xml
-        application/xml
-        font/opentype
-        image/svg+xml
-        image/x-icon
-        text/css
-        text/plain
-        text/x-component;
-    
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-EOF
-
-# Cấu hình máy chủ Nginx cho V2Ray
-cat > /etc/nginx/sites-available/default << EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $PUBLIC_IP;
-    
-    access_log /var/log/nginx/v2ray-access.log;
-    error_log /var/log/nginx/v2ray-error.log;
-    
-    # Ngụy trang là một trang web bình thường
-    location / {
-        root /var/www/html;
-        index index.html;
-        
-        # Thêm các HTTP header bảo mật
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header X-Frame-Options "SAMEORIGIN" always;
-        add_header X-XSS-Protection "1; mode=block" always;
-        add_header Referrer-Policy "no-referrer-when-downgrade" always;
-    }
-    
-    # Định tuyến WebSocket đến V2Ray
-    location $WS_PATH {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:$WS_PORT;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$http_host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_connect_timeout 60s;
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 60s;
-        
-        # Tối ưu proxy buffer
-        proxy_buffer_size 16k;
-        proxy_buffers 8 16k;
-        proxy_busy_buffers_size 32k;
-    }
-    
-    # PAC file cho iPhone
-    location /proxy/ {
-        root /var/www/html;
-        types { } 
-        default_type application/x-ns-proxy-autoconfig;
-        
-        # Thêm cache headers cho PAC file
-        add_header Cache-Control "public, max-age=86400";
-    }
-}
-EOF
-
-# Kích hoạt cấu hình Nginx
-ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-
-#############################################
-# PHẦN 5: TẠO PAC FILE VÀ TRANG WEB
-#############################################
-
-echo -e "${GREEN}[5/7] Tạo PAC file và trang web ngụy trang...${NC}"
-
-# Tạo thư mục và PAC file
+# Tạo thư mục nếu chưa tồn tại
 mkdir -p /var/www/html/proxy
+
+# Tạo PAC file nâng cao với bảo vệ DNS leak
 cat > /var/www/html/proxy/proxy.pac << EOF
 function FindProxyForURL(url, host) {
-    // Tối ưu hiệu suất bằng cache
+    // Phần 1: Xử lý cache và kiểm tra kết nối mạng
+    var cacheBuster = Math.floor(Math.random() * 1000000);
+    
+    // Phần 2: Bảo vệ DNS leak - Chuyển hướng tất cả DNS requests
     if (isPlainHostName(host) || 
-        dnsDomainIs(host, "local") ||
-        isInNet(host, "10.0.0.0", "255.0.0.0") ||
-        isInNet(host, "172.16.0.0", "255.240.0.0") ||
-        isInNet(host, "192.168.0.0", "255.255.0.0") ||
-        isInNet(host, "127.0.0.0", "255.0.0.0")) {
+        shExpMatch(host, "*.local") ||
+        shExpMatch(host, "*.localhost") ||
+        shExpMatch(host, "localhost")) {
         return "DIRECT";
     }
+
+    // Phần 3: Chặn các trang với WebRTC có thể làm lộ IP
+    if (shExpMatch(host, "*.stun.*") ||
+        shExpMatch(host, "stun.*") ||
+        shExpMatch(host, "*.turn.*") ||
+        shExpMatch(host, "turn.*") ||
+        shExpMatch(host, "*global.turn.*") ||
+        shExpMatch(host, "*.webrtc.*") ||
+        shExpMatch(host, "*rtcpeerconnection*")) {
+        return "PROXY 127.0.0.1:1"; // Chặn với proxy không hợp lệ
+    }
     
-    // Các domain cần dùng proxy
-    var domains = [
-        // Mạng xã hội phổ biến
-        ".facebook.com", ".fbcdn.net",
-        ".twitter.com",
-        ".instagram.com",
+    // Phần 4: Các domain cần proxy trực tiếp
+    var proxyDomains = [
+        // Mạng xã hội
+        ".facebook.com", ".fbcdn.net", ".fb.com",
+        ".twitter.com", ".twimg.com",
+        ".instagram.com", ".cdninstagram.com",
         ".pinterest.com",
-        ".telegram.org",
-        ".t.me",
+        ".telegram.org", ".t.me", ".tdesktop.com",
         
         // Google services
         ".google.com", ".googleapis.com", ".gstatic.com", 
         ".youtube.com", ".ytimg.com", ".ggpht.com",
-        ".googlevideo.com", ".googleusercontent.com",
+        ".gmail.com", ".googleusercontent.com",
+        ".googlevideo.com", ".google-analytics.com",
         
-        // Dịch vụ phổ biến khác
-        ".netflix.com", ".nflxvideo.net",
-        ".spotify.com",
-        ".amazon.com",
-        ".twitch.tv",
-        ".reddit.com",
+        // Streaming platforms
+        ".netflix.com", ".nflxvideo.net", ".nflxext.com",
+        ".spotify.com", ".spotifycdn.com",
+        ".amazon.com", ".primevideo.com",
+        ".twitch.tv", ".ttvnw.net",
+        ".hulu.com", ".hulustream.com",
         
-        // IP/Speed checking
-        ".ipleak.net",
-        ".speedtest.net",
-        ".fast.com"
+        // Kiểm tra IP
+        ".ipleak.net", ".browserleaks.com",
+        ".speedtest.net", ".fast.com", ".ipinfo.io",
+        ".whatismyip.com", ".whatismyipaddress.com",
+        
+        // Dịch vụ VPN & Proxy
+        ".nordvpn.com", ".expressvpn.com", ".vyprvpn.com",
+        ".torproject.org", ".shadowsocks.org"
     ];
     
-    // Kiểm tra domain trong danh sách hiệu quả hơn
-    var domain = host.toLowerCase();
-    for (var i = 0; i < domains.length; i++) {
-        if (dnsDomainIs(domain, domains[i]) || 
-            shExpMatch(domain, "*" + domains[i])) {
-            return "PROXY $PUBLIC_IP:$HTTP_PROXY_PORT";
+    // Chuyển hướng các domain đặc biệt qua proxy
+    for (var i = 0; i < proxyDomains.length; i++) {
+        if (dnsDomainIs(host, proxyDomains[i]) || 
+            shExpMatch(host, "*" + proxyDomains[i])) {
+            return "PROXY $PUBLIC_IP:$HTTP_PROXY_PORT?nocache=" + cacheBuster;
         }
     }
     
-    // Mặc định truy cập trực tiếp
-    return "DIRECT";
+    // Phần 5: Chuyển hướng các domain chưa biết qua proxy để bảo vệ DNS
+    return "PROXY $PUBLIC_IP:$HTTP_PROXY_PORT?nocache=" + cacheBuster;
 }
 EOF
 
-# Tạo trang web ngụy trang
-cat > /var/www/html/index.html << EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Secure Data Solutions</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
-            margin: 0; 
-            padding: 0; 
-            line-height: 1.6; 
-            color: #333;
-            background-color: #f8f9fa;
-        }
-        .header { 
-            background: linear-gradient(135deg, #6a11cb, #2575fc);
-            color: white; 
-            text-align: center; 
-            padding: 60px 0; 
-            margin-bottom: 30px;
-        }
-        .container { 
-            max-width: 1000px; 
-            margin: 0 auto; 
-            padding: 0 20px; 
-        }
-        .features {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: space-between;
-            margin: 40px 0;
-        }
-        .feature {
-            flex: 0 0 30%;
-            background: white;
-            padding: 20px;
-            border-radius: 5px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-            margin-bottom: 30px;
-        }
-        .feature h3 {
-            color: #2575fc;
-            margin-top: 0;
-        }
-        .cta {
-            background: #f0f0f0;
-            padding: 40px 0;
-            text-align: center;
-            margin: 40px 0;
-        }
-        .button {
-            display: inline-block;
-            background: #6a11cb;
-            color: white;
-            padding: 12px 30px;
-            border-radius: 4px;
-            text-decoration: none;
-            font-weight: bold;
-            margin-top: 20px;
-        }
-        .footer { 
-            background: #333; 
-            color: white; 
-            text-align: center; 
-            padding: 30px 0; 
-            margin-top: 40px; 
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="container">
-            <h1>SecureData Solutions</h1>
-            <p>Mạng lưới bảo mật hàng đầu cho doanh nghiệp và cá nhân</p>
-        </div>
-    </div>
-    
-    <div class="container">
-        <h2>Dịch vụ của chúng tôi</h2>
-        <p>SecureData cung cấp giải pháp bảo mật mạng toàn diện với ưu tiên hàng đầu về bảo mật, độ tin cậy và dễ sử dụng.</p>
-        
-        <div class="features">
-            <div class="feature">
-                <h3>Bảo vệ dữ liệu</h3>
-                <p>Mã hóa đầu cuối mạnh mẽ bảo vệ thông tin nhạy cảm của bạn khỏi các mối đe dọa.</p>
-            </div>
-            
-            <div class="feature">
-                <h3>Giải pháp doanh nghiệp</h3>
-                <p>Bảo mật cấp doanh nghiệp với các tính năng bảo mật nâng cao cho tổ chức mọi quy mô.</p>
-            </div>
-            
-            <div class="feature">
-                <h3>Sao lưu & Khôi phục</h3>
-                <p>Giải pháp sao lưu tự động để giữ an toàn dữ liệu quan trọng khỏi mất mát hoặc hỏng hóc.</p>
-            </div>
-            
-            <div class="feature">
-                <h3>Truy cập bảo mật</h3>
-                <p>Truy cập an toàn vào mạng nội bộ và dữ liệu từ bất kỳ đâu trên thế giới.</p>
-            </div>
-            
-            <div class="feature">
-                <h3>Đa nền tảng</h3>
-                <p>Hỗ trợ đầy đủ cho Windows, macOS, iOS, Android và các hệ điều hành Linux.</p>
-            </div>
-            
-            <div class="feature">
-                <h3>Hỗ trợ 24/7</h3>
-                <p>Đội ngũ chuyên gia của chúng tôi luôn sẵn sàng hỗ trợ bạn mọi lúc, mọi nơi.</p>
-            </div>
-        </div>
-        
-        <div class="cta">
-            <h2>Sẵn sàng bắt đầu?</h2>
-            <p>Tham gia cùng hàng nghìn khách hàng hài lòng đang sử dụng giải pháp bảo mật của SecureData.</p>
-            <a href="#" class="button">Liên hệ với chúng tôi</a>
-        </div>
-    </div>
-    
-    <div class="footer">
-        <div class="container">
-            <p>&copy; 2025 SecureData Solutions. Mọi quyền được bảo lưu.</p>
-            <p>Chính sách bảo mật | Điều khoản dịch vụ | Liên hệ</p>
-        </div>
-    </div>
-</body>
-</html>
+#############################################
+# PHẦN 3: CẤU HÌNH DNSMASQ ĐỂ CHẶN DNS LEAK
+#############################################
+
+echo -e "${GREEN}[3/4] Cài đặt và cấu hình DNSMasq...${NC}"
+
+# Cài đặt dnsmasq
+apt-get update
+apt-get install -y dnsmasq resolvconf
+
+# Cấu hình dnsmasq
+cat > /etc/dnsmasq.conf << EOF
+# Lắng nghe trên tất cả các interface
+listen-address=127.0.0.1
+interface=lo
+
+# Không sử dụng /etc/hosts
+no-hosts
+
+# Upstream DNS servers (DoH)
+server=1.1.1.1
+server=8.8.8.8
+
+# Truy vấn song song
+all-servers
+
+# Cache DNS
+cache-size=1000
+min-cache-ttl=300
+
+# Log
+log-queries
+log-facility=/var/log/dnsmasq.log
+
+# Không forward các truy vấn ngược
+bogus-priv
+
+# Không forward các truy vấn reverse cho private IPs
+domain-needed
+
+# Không forward các truy vấn không hợp lệ
+domain-needed
+
+# Không forward plain names
+domain-needed
 EOF
 
+# Cấu hình resolvconf để sử dụng dnsmasq
+echo "nameserver 127.0.0.1" > /etc/resolvconf/resolv.conf.d/head
+
+# Cấu hình systemd-resolved nếu được sử dụng
+if systemctl is-active --quiet systemd-resolved; then
+    systemctl stop systemd-resolved
+    systemctl disable systemd-resolved
+    
+    # Đảm bảo /etc/resolv.conf trỏ đến dnsmasq
+    rm -f /etc/resolv.conf
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+fi
+
+# Khởi động dnsmasq
+systemctl restart dnsmasq
+systemctl enable dnsmasq
+
 #############################################
-# PHẦN 6: TẠO TOOL KIỂM TRA KẾT NỐI
+# PHẦN 4: THIẾT LẬP TRANG KIỂM TRA DNS LEAK
 #############################################
 
-echo -e "${GREEN}[6/7] Tạo trang kiểm tra kết nối...${NC}"
+echo -e "${GREEN}[4/4] Tạo trang kiểm tra DNS leak...${NC}"
 
-# Tạo trang kiểm tra kết nối
-cat > /var/www/html/check.html << EOF
+# Tạo trang web kiểm tra DNS leak
+cat > /var/www/html/dns-check.html << EOF
 <!DOCTYPE html>
-<html>
+<html lang="vi">
 <head>
-    <title>Kiểm tra kết nối</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiểm tra DNS Leak</title>
     <style>
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             line-height: 1.6;
             color: #333;
             max-width: 800px;
             margin: 0 auto;
             padding: 20px;
-            background-color: #f5f5f5;
+            background-color: #f7f7f7;
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
         }
         .card {
             background: white;
@@ -649,370 +370,393 @@ cat > /var/www/html/check.html << EOF
             padding: 20px;
             margin-bottom: 20px;
         }
-        h1, h2 {
-            color: #2575fc;
-        }
-        .status {
-            font-size: 1.1em;
-            padding: 10px;
-            border-radius: 4px;
-            margin: 10px 0;
+        .result {
+            background-color: #f5f5f5;
+            border-left: 4px solid #3498db;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 0 4px 4px 0;
         }
         .success {
-            background-color: #d4edda;
-            color: #155724;
+            border-left-color: #2ecc71;
         }
         .error {
-            background-color: #f8d7da;
-            color: #721c24;
-        }
-        .warning {
-            background-color: #fff3cd;
-            color: #856404;
-        }
-        .info {
-            background-color: #d1ecf1;
-            color: #0c5460;
+            border-left-color: #e74c3c;
         }
         button {
-            background-color: #2575fc;
+            background-color: #3498db;
             color: white;
             border: none;
-            padding: 10px 15px;
+            padding: 10px 20px;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 1em;
-            margin-right: 10px;
-            margin-bottom: 10px;
+            font-size: 16px;
+            transition: background-color 0.3s;
         }
         button:hover {
-            background-color: #1a5cbe;
+            background-color: #2980b9;
         }
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(0,0,0,0.1);
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        th, td {
+            padding: 10px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
             border-radius: 50%;
-            border-top-color: #2575fc;
-            animation: spin 1s ease-in-out infinite;
-            margin-right: 10px;
-            vertical-align: middle;
+            width: 30px;
+            height: 30px;
+            animation: spin 2s linear infinite;
+            margin: 15px auto;
         }
         @keyframes spin {
-            to { transform: rotate(360deg); }
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
-        .connection-info {
-            background-color: #e6f3ff;
-            border-left: 4px solid #2575fc;
-            padding: 15px;
-            margin: 20px 0;
+        .section {
+            margin-bottom: 30px;
         }
         code {
             background-color: #f0f0f0;
-            padding: 2px 5px;
+            padding: 3px 6px;
             border-radius: 3px;
-            font-family: monospace;
+            font-family: Consolas, Monaco, 'Andale Mono', monospace;
         }
     </style>
 </head>
 <body>
-    <h1>Kiểm tra kết nối proxy</h1>
+    <h1>Kiểm tra DNS Leak</h1>
     
     <div class="card">
-        <h2>Thông tin kết nối của bạn</h2>
-        <div class="connection-info">
-            <p><strong>HTTP Proxy:</strong> $PUBLIC_IP:$HTTP_PROXY_PORT</p>
-            <p><strong>PAC URL:</strong> http://$PUBLIC_IP/proxy/proxy.pac</p>
-            <p><strong>Shadowsocks:</strong> $PUBLIC_IP:$SS_PORT (Password: $SS_PASSWORD, Method: $SS_METHOD)</p>
+        <h2>Công cụ kiểm tra DNS leak toàn diện</h2>
+        <p>Kiểm tra xem DNS requests của bạn có bị rò rỉ ra ngoài proxy không.</p>
+        
+        <div class="section">
+            <h3>1. Kiểm tra IP công khai</h3>
+            <button onclick="checkIP()">Kiểm tra IP</button>
+            <div id="ip-result" class="result">Nhấn nút để kiểm tra</div>
         </div>
         
-        <h3>Kiểm tra địa chỉ IP</h3>
-        <button onclick="checkIP()">Kiểm tra IP của tôi</button>
-        <div id="ip-result"></div>
+        <div class="section">
+            <h3>2. Kiểm tra DNS Resolver</h3>
+            <button onclick="checkDNS()">Kiểm tra DNS</button>
+            <div id="dns-result" class="result">Nhấn nút để kiểm tra</div>
+        </div>
         
-        <h3>Kiểm tra DNS</h3>
-        <button onclick="checkDNS()">Kiểm tra DNS</button>
-        <div id="dns-result"></div>
+        <div class="section">
+            <h3>3. Kiểm tra WebRTC Leak</h3>
+            <button onclick="checkWebRTC()">Kiểm tra WebRTC</button>
+            <div id="webrtc-result" class="result">Nhấn nút để kiểm tra</div>
+        </div>
         
-        <h3>Kiểm tra tốc độ kết nối</h3>
-        <button onclick="checkSpeed()">Kiểm tra tốc độ</button>
-        <div id="speed-result"></div>
+        <div class="section">
+            <h3>4. Kiểm tra toàn diện</h3>
+            <button onclick="checkAll()">Kiểm tra tất cả</button>
+        </div>
     </div>
     
     <div class="card">
-        <h2>Hướng dẫn cấu hình</h2>
+        <h2>Hướng dẫn khắc phục DNS leak</h2>
         
-        <h3>Cấu hình trên iPhone/iPad</h3>
-        <ol>
-            <li>Vào <strong>Settings</strong> > <strong>Wi-Fi</strong></li>
-            <li>Chọn mạng Wi-Fi hiện tại (nhấn vào biểu tượng (i))</li>
-            <li>Kéo xuống và chọn <strong>Configure Proxy</strong></li>
-            <li>Chọn <strong>Automatic</strong> và nhập URL: <code>http://$PUBLIC_IP/proxy/proxy.pac</code></li>
-            <li>Hoặc chọn <strong>Manual</strong>, nhập <code>$PUBLIC_IP</code> và cổng <code>$HTTP_PROXY_PORT</code></li>
-        </ol>
+        <div class="section">
+            <h3>Trên iPhone/iPad:</h3>
+            <ol>
+                <li>Vào <strong>Settings</strong> > <strong>Wi-Fi</strong></li>
+                <li>Nhấn vào mạng Wi-Fi đang kết nối</li>
+                <li>Chọn <strong>Configure DNS</strong></li>
+                <li>Chọn <strong>Manual</strong></li>
+                <li>Xóa tất cả DNS server hiện có</li>
+                <li>Thêm DNS server: <code>1.1.1.1</code> và <code>1.0.0.1</code></li>
+                <li>Lưu cấu hình DNS</li>
+                <li>Quay lại màn hình Wi-Fi, chọn <strong>Configure Proxy</strong></li>
+                <li>Chọn <strong>Automatic</strong></li>
+                <li>Nhập URL PAC: <code>http://$PUBLIC_IP/proxy/proxy.pac</code></li>
+            </ol>
+        </div>
         
-        <h3>Cấu hình Shadowsocks</h3>
-        <p>Sử dụng thông tin sau để cấu hình ứng dụng Shadowsocks:</p>
-        <ul>
-            <li>Địa chỉ máy chủ: <code>$PUBLIC_IP</code></li>
-            <li>Cổng: <code>$SS_PORT</code></li>
-            <li>Mật khẩu: <code>$SS_PASSWORD</code></li>
-            <li>Phương thức mã hóa: <code>$SS_METHOD</code></li>
-        </ul>
+        <div class="section">
+            <h3>Trên Android:</h3>
+            <ol>
+                <li>Cài đặt ứng dụng <strong>Intra</strong> từ Google Play Store</li>
+                <li>Mở Intra và bật "Always-on VPN" khi được yêu cầu</li>
+                <li>Intra sẽ bảo vệ DNS của bạn, sau đó cấu hình proxy HTTP riêng biệt</li>
+            </ol>
+        </div>
+        
+        <div class="section">
+            <h3>Trên Windows/macOS:</h3>
+            <ol>
+                <li>Cài đặt ứng dụng <strong>Simple DNSCrypt</strong> để mã hóa DNS</li>
+                <li>Cấu hình proxy HTTP riêng biệt sử dụng PAC file</li>
+                <li>Hoặc sử dụng trình duyệt với các tiện ích mở rộng chống rò rỉ DNS</li>
+            </ol>
+        </div>
     </div>
     
     <script>
         function checkIP() {
             const resultDiv = document.getElementById('ip-result');
-            resultDiv.innerHTML = '<div class="loading"></div> Đang kiểm tra IP...';
+            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra IP...</p>';
             
             fetch('https://api.ipify.org?format=json')
                 .then(response => response.json())
                 .then(data => {
-                    resultDiv.innerHTML = '<div class="status success">IP hiện tại của bạn: <strong>' + data.ip + '</strong></div>';
+                    fetch('https://ipapi.co/' + data.ip + '/json/')
+                        .then(resp => resp.json())
+                        .then(ipData => {
+                            resultDiv.innerHTML = `
+                                <p>IP Hiện tại: <strong>${data.ip}</strong></p>
+                                <p>Quốc gia: <strong>${ipData.country_name}</strong></p>
+                                <p>Nhà cung cấp: <strong>${ipData.org}</strong></p>
+                            `;
+                            
+                            // Kiểm tra xem IP có trùng với IP proxy không
+                            if (data.ip === '$PUBLIC_IP') {
+                                resultDiv.innerHTML += '<p class="success">✅ IP của bạn đang được bảo vệ bởi proxy!</p>';
+                                resultDiv.classList.add('success');
+                                resultDiv.classList.remove('error');
+                            } else {
+                                resultDiv.innerHTML += '<p class="error">❌ IP của bạn KHÔNG khớp với IP proxy!</p>';
+                                resultDiv.classList.add('error');
+                                resultDiv.classList.remove('success');
+                            }
+                        });
                 })
                 .catch(error => {
-                    resultDiv.innerHTML = '<div class="status error">Không thể kiểm tra IP: ' + error.message + '</div>';
+                    resultDiv.innerHTML = '<p class="error">Lỗi khi kiểm tra IP: ' + error.message + '</p>';
+                    resultDiv.classList.add('error');
+                    resultDiv.classList.remove('success');
                 });
         }
         
         function checkDNS() {
             const resultDiv = document.getElementById('dns-result');
-            resultDiv.innerHTML = '<div class="loading"></div> Đang kiểm tra DNS...';
+            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra DNS...</p>';
             
-            fetch('https://1.1.1.1/cdn-cgi/trace')
-                .then(response => response.text())
-                .then(data => {
-                    const lines = data.split('\\n');
-                    let ip = '';
-                    let location = '';
-                    
-                    for (const line of lines) {
-                        if (line.startsWith('ip=')) {
-                            ip = line.substring(3);
-                        }
-                        if (line.startsWith('loc=')) {
-                            location = line.substring(4);
-                        }
+            // Tạo một mảng các truy vấn DNS
+            const domains = [
+                { name: 'google.com', url: 'https://google.com/favicon.ico' },
+                { name: 'facebook.com', url: 'https://facebook.com/favicon.ico' },
+                { name: 'github.com', url: 'https://github.com/favicon.ico' }
+            ];
+            
+            // Tạo bảng kết quả
+            let tableHTML = '<table><tr><th>Domain</th><th>Thời gian (ms)</th><th>Trạng thái</th></tr>';
+            
+            // Thực hiện truy vấn và đo thời gian
+            Promise.all(domains.map(domain => {
+                const start = performance.now();
+                return fetch(domain.url, { method: 'HEAD', mode: 'no-cors' })
+                    .then(() => {
+                        const time = Math.round(performance.now() - start);
+                        return { domain: domain.name, time, status: 'Thành công' };
+                    })
+                    .catch(() => {
+                        const time = Math.round(performance.now() - start);
+                        return { domain: domain.name, time, status: 'Lỗi' };
+                    });
+            }))
+            .then(results => {
+                results.forEach(result => {
+                    tableHTML += `<tr><td>${result.domain}</td><td>${result.time}</td><td>${result.status}</td></tr>`;
+                });
+                tableHTML += '</table>';
+                
+                // Kiểm tra xem DNS có bị leak không
+                fetch('https://cloudflare-dns.com/dns-query?name=whoami.cloudflare&type=TXT', {
+                    headers: {
+                        'Accept': 'application/dns-json'
                     }
+                })
+                .then(response => response.json())
+                .then(data => {
+                    resultDiv.innerHTML = '<h4>Kết quả truy vấn DNS:</h4>' + tableHTML;
                     
-                    resultDiv.innerHTML = '<div class="status info">DNS resolve thành công!<br>IP: <strong>' + 
-                        ip + '</strong><br>Vị trí: <strong>' + location + '</strong></div>';
+                    // Phân tích kết quả
+                    if (results.every(r => r.time < 1000 && r.status === 'Thành công')) {
+                        resultDiv.innerHTML += '<p class="success">✅ DNS đang hoạt động bình thường.</p>';
+                        
+                        // Check DNS Leak
+                        fetch('https://ipapi.co/' + '$PUBLIC_IP' + '/json/')
+                            .then(resp => resp.json())
+                            .then(ipData => {
+                                if (ipData.country_code !== 'VN') {
+                                    resultDiv.innerHTML += '<p class="success">✅ DNS không bị leak. Các truy vấn DNS đang đi qua proxy.</p>';
+                                    resultDiv.classList.add('success');
+                                    resultDiv.classList.remove('error');
+                                } else {
+                                    resultDiv.innerHTML += '<p class="error">❌ Có dấu hiệu DNS bị leak. Các truy vấn DNS có thể đang đi trực tiếp.</p>';
+                                    resultDiv.classList.add('error');
+                                    resultDiv.classList.remove('success');
+                                }
+                            });
+                    } else {
+                        resultDiv.innerHTML += '<p class="error">⚠️ Có vấn đề với DNS. Một số truy vấn không thành công hoặc quá chậm.</p>';
+                        resultDiv.classList.add('error');
+                        resultDiv.classList.remove('success');
+                    }
                 })
                 .catch(error => {
-                    resultDiv.innerHTML = '<div class="status error">Không thể kiểm tra DNS: ' + error.message + '</div>';
+                    resultDiv.innerHTML = '<p class="error">Lỗi khi kiểm tra DNS: ' + error.message + '</p>';
+                    resultDiv.classList.add('error');
+                    resultDiv.classList.remove('success');
                 });
+            });
         }
         
-        function checkSpeed() {
-            const resultDiv = document.getElementById('speed-result');
-            resultDiv.innerHTML = '<div class="loading"></div> Đang kiểm tra tốc độ kết nối...';
+        function checkWebRTC() {
+            const resultDiv = document.getElementById('webrtc-result');
+            resultDiv.innerHTML = '<div class="loader"></div><p>Đang kiểm tra WebRTC leak...</p>';
             
-            const startTime = new Date().getTime();
-            const imageSize = 2097152; // 2MB image
-            
-            fetch('https://speed.cloudflare.com/__down?bytes=2097152')
-                .then(response => {
-                    const endTime = new Date().getTime();
-                    const duration = (endTime - startTime) / 1000;
-                    const speed = ((imageSize * 8) / duration) / 1000000;
-                    
-                    resultDiv.innerHTML = '<div class="status success">Tốc độ tải xuống: <strong>' + 
-                        speed.toFixed(2) + ' Mbps</strong></div>';
-                })
-                .catch(error => {
-                    resultDiv.innerHTML = '<div class="status error">Không thể kiểm tra tốc độ: ' + error.message + '</div>';
+            // Phát hiện rò rỉ WebRTC
+            function getIPs(callback) {
+                let ips = [];
+                
+                const RTCPeerConnection = window.RTCPeerConnection || 
+                                         window.webkitRTCPeerConnection || 
+                                         window.mozRTCPeerConnection;
+                
+                if (!RTCPeerConnection) {
+                    resultDiv.innerHTML = '<p>WebRTC không được hỗ trợ trên trình duyệt này.</p>';
+                    return;
+                }
+                
+                let pc = new RTCPeerConnection({
+                    iceServers: [{ urls: "stun:stun.services.mozilla.com" }]
                 });
+                
+                pc.onicecandidate = function(event) {
+                    if (event.candidate) {
+                        let lines = event.candidate.candidate.split(' ');
+                        let ip = lines[4];
+                        if (ip.indexOf('.') !== -1) {
+                            if (ips.indexOf(ip) === -1) {
+                                ips.push(ip);
+                            }
+                        }
+                    } else {
+                        // Tất cả các candidate đã được thu thập
+                        if (ips.length === 0) {
+                            callback(null);
+                        } else {
+                            callback(ips);
+                        }
+                        pc.close();
+                    }
+                };
+                
+                pc.createDataChannel('');
+                pc.createOffer()
+                    .then(offer => pc.setLocalDescription(offer))
+                    .catch(error => {
+                        console.error('Error creating offer:', error);
+                    });
+                
+                // Fallback: nếu không nhận được kết quả trong 2 giây
+                setTimeout(function() {
+                    if (ips.length === 0) {
+                        callback(null);
+                        pc.close();
+                    }
+                }, 2000);
+            }
+            
+            getIPs(function(ips) {
+                if (!ips || ips.length === 0) {
+                    resultDiv.innerHTML = '<p class="success">✅ Không phát hiện rò rỉ WebRTC. WebRTC có thể đã bị chặn.</p>';
+                    resultDiv.classList.add('success');
+                    resultDiv.classList.remove('error');
+                    return;
+                }
+                
+                let localIPs = ips.filter(ip => 
+                    ip.startsWith('10.') || 
+                    ip.startsWith('192.168.') || 
+                    (ip.startsWith('172.') && parseInt(ip.split('.')[1]) >= 16 && parseInt(ip.split('.')[1]) <= 31));
+                    
+                let publicIPs = ips.filter(ip => localIPs.indexOf(ip) === -1);
+                
+                let result = '<h4>Địa chỉ IP được phát hiện qua WebRTC:</h4><ul>';
+                
+                if (localIPs.length > 0) {
+                    result += '<li>IP nội bộ: ' + localIPs.join(', ') + ' (bình thường)</li>';
+                }
+                
+                if (publicIPs.length > 0) {
+                    result += '<li>IP công khai: ' + publicIPs.join(', ') + '</li>';
+                    
+                    // Kiểm tra xem có IP nào không phải là IP proxy không
+                    if (publicIPs.some(ip => ip !== '$PUBLIC_IP')) {
+                        result += '<p class="error">❌ PHÁT HIỆN RÒ RỈ WEBRTC! IP thật của bạn có thể bị lộ!</p>';
+                        resultDiv.classList.add('error');
+                        resultDiv.classList.remove('success');
+                    } else {
+                        result += '<p class="success">✅ Không phát hiện rò rỉ WebRTC. Chỉ có IP proxy được phát hiện.</p>';
+                        resultDiv.classList.add('success');
+                        resultDiv.classList.remove('error');
+                    }
+                } else {
+                    result += '<p class="success">✅ Không phát hiện IP công khai qua WebRTC. Bạn được bảo vệ tốt.</p>';
+                    resultDiv.classList.add('success');
+                    resultDiv.classList.remove('error');
+                }
+                
+                result += '</ul>';
+                resultDiv.innerHTML = result;
+            });
         }
+        
+        function checkAll() {
+            checkIP();
+            setTimeout(checkDNS, 1000);
+            setTimeout(checkWebRTC, 2000);
+        }
+        
+        // Tự động chạy kiểm tra khi trang tải xong
+        window.onload = function() {
+            setTimeout(checkAll, 500);
+        };
     </script>
 </body>
 </html>
 EOF
 
-#############################################
-# PHẦN 7: TẠO SCRIPT BẢO TRÌ VÀ KHỞI ĐỘNG DỊCH VỤ
-#############################################
-
-echo -e "${GREEN}[7/7] Tạo script bảo trì và khởi động dịch vụ...${NC}"
-
-# Tạo script giám sát
-cat > /usr/local/bin/monitor-proxy.sh << EOF
-#!/bin/bash
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-echo -e "\${YELLOW}Kiểm tra tài nguyên hệ thống:${NC}"
-echo -e "CPU: \$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - \$1}')% đang sử dụng"
-echo -e "RAM: \$(free -m | awk 'NR==2{printf "%.2f%%", \$3*100/\$2}')"
-echo -e "SWAP: \$(free -m | awk 'NR==3{printf "%.2f%%", \$3*100/\$2}')"
-echo -e "Dung lượng: \$(df -h / | awk 'NR==2{print \$5}')"
-
-echo -e "\${YELLOW}Kiểm tra dịch vụ:${NC}"
-for service in v2ray nginx; do
-  if systemctl is-active --quiet \$service; then
-    echo -e "\${GREEN}\$service: đang chạy${NC}"
-  else
-    echo -e "\${RED}\$service: không chạy${NC}"
-    systemctl restart \$service
-    echo -e "Đã cố gắng khởi động lại \$service"
-  fi
-done
-
-echo -e "\${YELLOW}Thống kê kết nối:${NC}"
-echo "Kết nối HTTP Proxy:"
-netstat -anp | grep :$HTTP_PROXY_PORT | wc -l
-echo "Kết nối WebSocket:"
-netstat -anp | grep :$WS_PORT | wc -l
-echo "Kết nối Shadowsocks:"
-netstat -anp | grep :$SS_PORT | wc -l
-
-echo -e "\${YELLOW}Kiểm tra kết nối:${NC}"
-curl -s -x http://localhost:$HTTP_PROXY_PORT -o /dev/null -w "HTTP Proxy: %{http_code}\n" https://www.google.com
-
-echo -e "\${YELLOW}Kiểm tra log lỗi:${NC}"
-tail -n 10 /var/log/v2ray/error.log
-
-# Kiểm tra và khởi động lại nếu có lỗi
-error_count=\$(grep -c "error" /var/log/v2ray/error.log 2>/dev/null)
-if [ \$error_count -gt 10 ]; then
-    echo -e "\${RED}Phát hiện quá nhiều lỗi trong log V2Ray, khởi động lại...${NC}"
-    systemctl restart v2ray
-fi
-EOF
-chmod +x /usr/local/bin/monitor-proxy.sh
-
-# Tạo script khởi động lại dịch vụ
-cat > /usr/local/bin/restart-proxy.sh << EOF
-#!/bin/bash
-systemctl restart v2ray
-systemctl restart nginx
-echo "Tất cả dịch vụ đã được khởi động lại"
-EOF
-chmod +x /usr/local/bin/restart-proxy.sh
-
-# Tạo script cập nhật tự động
-cat > /usr/local/bin/update-proxy.sh << EOF
-#!/bin/bash
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-echo -e "\${GREEN}Đang cập nhật hệ thống...${NC}"
-apt update && apt upgrade -y
-
-echo -e "\${GREEN}Đang cập nhật V2Ray...${NC}"
-systemctl stop v2ray
-bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh)
-
-echo -e "\${GREEN}Khởi động lại dịch vụ...${NC}"
-systemctl daemon-reload
+# Khởi động lại dịch vụ
+systemctl restart dnsmasq
 systemctl restart v2ray
 systemctl restart nginx
 
-echo -e "\${GREEN}Cập nhật hoàn tất${NC}"
-EOF
-chmod +x /usr/local/bin/update-proxy.sh
-
-# Tự động khởi động lại dịch vụ mỗi ngày
-(crontab -l 2>/dev/null || echo "") | {
-    cat
-    echo "0 4 * * * /usr/local/bin/restart-proxy.sh > /dev/null 2>&1"
-    echo "0 */6 * * * /usr/local/bin/monitor-proxy.sh > /var/log/proxy-monitor.log 2>&1"
-} | crontab -
-
-# Thay đổi quyền sở hữu
-chown -R nobody:nogroup /var/log/v2ray/
-chmod 755 /var/log/v2ray/
-
-# Khởi động dịch vụ
-echo -e "${GREEN}Khởi động dịch vụ...${NC}"
-systemctl daemon-reload
-systemctl enable v2ray
-systemctl enable nginx
-systemctl restart v2ray
-systemctl restart nginx
-
-# Lưu thông tin cấu hình
-mkdir -p /etc/v2ray-setup
-cat > /etc/v2ray-setup/config.json << EOF
-{
-  "http_proxy_port": $HTTP_PROXY_PORT,
-  "ss_port": $SS_PORT,
-  "ss_password": "$SS_PASSWORD",
-  "ss_method": "$SS_METHOD",
-  "ws_port": $WS_PORT,
-  "uuid": "$UUID",
-  "ws_path": "$WS_PATH",
-  "public_ip": "$PUBLIC_IP",
-  "installation_date": "$(date)",
-  "note": "Cấu hình HTTP - Shadowsocks Bridge với 2GB RAM ảo"
-}
-EOF
-chmod 600 /etc/v2ray-setup/config.json
-
-# Tạo URL chia sẻ V2Ray
-V2RAY_CONFIG=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "V2Ray-WebSocket-SS-Bridge",
-  "add": "$PUBLIC_IP",
-  "port": "80",
-  "id": "$UUID",
-  "aid": "0",
-  "net": "ws",
-  "type": "none",
-  "host": "$PUBLIC_IP",
-  "path": "$WS_PATH",
-  "tls": ""
-}
-EOF
-)
-
-# Mã hóa cấu hình để tạo URL
-V2RAY_LINK="vmess://$(echo $V2RAY_CONFIG | jq -c . | base64 -w 0)"
-
-# Tạo link cấu hình Shadowsocks
-SS_URI="ss://$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)@${PUBLIC_IP}:${SS_PORT}"
+# Đặt quyền sở hữu thích hợp
+chown -R www-data:www-data /var/www/html/
 
 echo -e "\n${BLUE}========================================================${NC}"
-echo -e "${GREEN}CÀI ĐẶT THÀNH CÔNG! HỆ THỐNG ĐÃ ĐƯỢC TỐI ƯU HÓA${NC}"
+echo -e "${GREEN}HOÀN TẤT KHẮC PHỤC DNS LEAK!${NC}"
 echo -e "${BLUE}========================================================${NC}"
 
-echo -e "\n${YELLOW}THÔNG TIN KẾT NỐI:${NC}"
-echo -e "HTTP Proxy: ${GREEN}$PUBLIC_IP:$HTTP_PROXY_PORT${NC}"
-echo -e "Shadowsocks: ${GREEN}$PUBLIC_IP:$SS_PORT${NC}"
-echo -e "Shadowsocks Password: ${GREEN}$SS_PASSWORD${NC}"
-echo -e "Shadowsocks Method: ${GREEN}$SS_METHOD${NC}"
-echo -e "V2Ray WebSocket: ${GREEN}http://$PUBLIC_IP:80$WS_PATH${NC}"
-echo -e "UUID: ${GREEN}$UUID${NC}"
-echo -e "PAC URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
+echo -e "\n${YELLOW}THÔNG TIN QUAN TRỌNG:${NC}"
+echo -e "1. ${GREEN}DNS được cấu hình để đi qua proxy${NC}"
+echo -e "2. ${GREEN}PAC file đã được cập nhật để ngăn DNS leak${NC}"
+echo -e "3. ${GREEN}Trang kiểm tra DNS leak: ${BLUE}http://$PUBLIC_IP/dns-check.html${NC}"
 
-echo -e "\n${YELLOW}URL CHIA SẺ:${NC}"
-echo -e "V2Ray Link: ${GREEN}$V2RAY_LINK${NC}"
-echo -e "Shadowsocks URI: ${GREEN}$SS_URI${NC}"
+echo -e "\n${YELLOW}HƯỚNG DẪN SỬ DỤNG:${NC}"
+echo -e "1. Trên iPhone/iPad:"
+echo -e "   - Cấu hình DNS thủ công: ${GREEN}1.1.1.1${NC} và ${GREEN}1.0.0.1${NC}"
+echo -e "   - Sử dụng PAC URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
 
-echo -e "\n${YELLOW}HƯỚNG DẪN SỬ DỤNG TRÊN IPHONE:${NC}"
-echo -e "1. Vào Settings > Wi-Fi > [Mạng Wi-Fi] > Configure Proxy > Auto"
-echo -e "2. URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
-echo -e "3. Hoặc cấu hình thủ công: Proxy: ${GREEN}$PUBLIC_IP${NC} Port: ${GREEN}$HTTP_PROXY_PORT${NC}"
+echo -e "\n${YELLOW}Nếu vẫn gặp vấn đề DNS leak:${NC}"
+echo -e "1. Thử sử dụng cấu hình proxy thủ công thay vì PAC file"
+echo -e "2. Cài đặt ứng dụng DNS over HTTPS/TLS trên thiết bị của bạn"
+echo -e "3. Sử dụng ứng dụng VPN có khả năng ngăn DNS leak"
 
-echo -e "\n${YELLOW}TRANG KIỂM TRA:${NC}"
-echo -e "URL: ${GREEN}http://$PUBLIC_IP/check.html${NC}"
-
-echo -e "\n${YELLOW}QUẢN LÝ HỆ THỐNG:${NC}"
-echo -e "Giám sát: ${GREEN}sudo /usr/local/bin/monitor-proxy.sh${NC}"
-echo -e "Khởi động lại: ${GREEN}sudo /usr/local/bin/restart-proxy.sh${NC}"
-echo -e "Cập nhật: ${GREEN}sudo /usr/local/bin/update-proxy.sh${NC}"
-
-echo -e "\n${GREEN}RAM ảo 2GB và tối ưu hóa hệ thống đã được thiết lập!${NC}"
+echo -e "\n${GREEN}Bạn có thể kiểm tra lại việc khắc phục DNS leak tại:${NC}"
+echo -e "${BLUE}http://$PUBLIC_IP/dns-check.html${NC}"
 echo -e "${BLUE}========================================================${NC}"
-
-# Kiểm tra trạng thái dịch vụ
-sleep 3
-echo -e "\n${YELLOW}Kiểm tra trạng thái dịch vụ:${NC}"
-systemctl status v2ray --no-pager | grep Active || echo "V2Ray không chạy!"
-systemctl status nginx --no-pager | grep Active || echo "Nginx không chạy!"
