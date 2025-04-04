@@ -13,7 +13,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "${BLUE}=== GIẢI PHÁP TRIỆT ĐỂ: TINYPROXY + SOCKS TUNNEL ====${NC}"
+echo -e "${BLUE}=== HTTP BRIDGE QUA GIAO THỨC PROXY HIỆN ĐẠI ====${NC}"
 
 # Lấy địa chỉ IP công cộng
 PUBLIC_IP=$(curl -s https://checkip.amazonaws.com || curl -s https://api.ipify.org || curl -s https://ifconfig.me)
@@ -24,13 +24,44 @@ fi
 
 # Thông số cấu hình
 HTTP_PROXY_PORT=8118
-SOCKS_PORT=1080
-SS_PORT=8388
-SS_PASSWORD=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
-SS_METHOD="chacha20-ietf-poly1305"
+VMESS_PORT=10086
+TROJAN_PORT=443
+VLESS_PORT=8443
+UUID=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 36 | head -n 1)
+TROJAN_PASSWORD=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+WS_PATH="/$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
+TAG="ProxyV2-$(date +%s)"
 
-# Thêm DNS server chất lượng cao
-DNS_SERVERS="1.1.1.1,8.8.8.8,9.9.9.9"
+# Yêu cầu người dùng chọn giao thức
+echo -e "${YELLOW}Chọn giao thức proxy hiện đại để bridge:${NC}"
+echo -e "1) VMess WebSocket (che giấu tốt, tương thích rộng rãi)"
+echo -e "2) Trojan (ngụy trang là HTTPS, bảo mật cao)"
+echo -e "3) VLESS + Reality (công nghệ ngụy trang mới nhất, không cần SSL)"
+read -p "Lựa chọn của bạn (mặc định: 1): " PROTOCOL_CHOICE
+PROTOCOL_CHOICE=${PROTOCOL_CHOICE:-1}
+
+# Cấu hình thông số theo giao thức được chọn
+case $PROTOCOL_CHOICE in
+  1)
+    PROTOCOL="VMess"
+    PROTOCOL_PORT=$VMESS_PORT
+    ;;
+  2)
+    PROTOCOL="Trojan"
+    PROTOCOL_PORT=$TROJAN_PORT
+    ;;
+  3)
+    PROTOCOL="VLESS"
+    PROTOCOL_PORT=$VLESS_PORT
+    ;;
+  *)
+    echo -e "${RED}Lựa chọn không hợp lệ, sử dụng VMess mặc định${NC}"
+    PROTOCOL="VMess"
+    PROTOCOL_PORT=$VMESS_PORT
+    ;;
+esac
+
+echo -e "${GREEN}Đã chọn giao thức: $PROTOCOL trên cổng $PROTOCOL_PORT${NC}"
 
 #############################################
 # PHẦN 1: DỪNG DỊCH VỤ CŨ
@@ -39,11 +70,10 @@ DNS_SERVERS="1.1.1.1,8.8.8.8,9.9.9.9"
 echo -e "${GREEN}[1/6] Dừng dịch vụ cũ...${NC}"
 
 # Dừng các dịch vụ nếu tồn tại
-for service in v2ray v2ray-client v2ray-server gost-bridge; do
+for service in v2ray v2ray-client v2ray-server xray xray-server xray-client tinyproxy gost-bridge ss-local shadowsocks-libev; do
   if systemctl list-unit-files | grep -q $service; then
     systemctl stop $service 2>/dev/null
     systemctl disable $service 2>/dev/null
-    rm -f /etc/systemd/system/$service.service 2>/dev/null
   fi
 done
 
@@ -53,7 +83,7 @@ done
 
 echo -e "${GREEN}[2/6] Cài đặt các gói cần thiết...${NC}"
 apt update -y
-apt install -y nginx curl wget unzip tinyproxy net-tools dnsutils iptables-persistent mtr traceroute jq
+apt install -y nginx curl wget unzip tinyproxy net-tools dnsutils iptables-persistent mtr traceroute jq cron socat lsof tar
 
 # Tạo 2GB swap nếu chưa có
 if [ "$(free | grep -c Swap)" -eq 0 ] || [ "$(free | grep Swap | awk '{print $2}')" -lt 1000000 ]; then
@@ -71,10 +101,10 @@ if [ "$(free | grep -c Swap)" -eq 0 ] || [ "$(free | grep Swap | awk '{print $2}
 fi
 
 #############################################
-# PHẦN 3: CÀI ĐẶT VÀ CẤU HÌNH TINYPROXY
+# PHẦN 3: CÀI ĐẶT XRAY/TINYPROXY
 #############################################
 
-echo -e "${GREEN}[3/6] Cài đặt và cấu hình Tinyproxy...${NC}"
+echo -e "${GREEN}[3/6] Cài đặt Xray và Tinyproxy...${NC}"
 
 # Cấu hình Tinyproxy
 cat > /etc/tinyproxy/tinyproxy.conf << EOF
@@ -92,76 +122,254 @@ MinSpareServers 5
 MaxSpareServers 20
 StartServers 10
 MaxRequestsPerChild 0
-ViaProxyName "proxy"
-ConnectPort 443
-ConnectPort 563
-ConnectPort 80
-ConnectPort 8080
-ConnectPort 8443
 DisableViaHeader Yes
 
-# Cho phép tất cả các kết nối (sẽ xử lý bảo mật ở mức iptables)
+# Cho phép tất cả các kết nối
 Allow 0.0.0.0/0
 
 # Kết nối đến localhost qua SOCKS
-Upstream socks5 127.0.0.1:$SOCKS_PORT
+Upstream socks5 127.0.0.1:1080
 EOF
 
-# Khởi động lại Tinyproxy
-systemctl restart tinyproxy
+# Cài đặt Xray
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-#############################################
-# PHẦN 4: CÀI ĐẶT VÀ CẤU HÌNH SHADOWSOCKS
-#############################################
+# Tạo thư mục cấu hình
+mkdir -p /usr/local/etc/xray
+mkdir -p /usr/local/share/xray
+mkdir -p /var/log/xray/
 
-echo -e "${GREEN}[4/6] Cài đặt và cấu hình Shadowsocks...${NC}"
-
-# Cài đặt Shadowsocks-libev
-apt install -y shadowsocks-libev
-
-# Cấu hình Shadowsocks
-cat > /etc/shadowsocks-libev/config.json << EOF
+# Cấu hình Xray dựa trên giao thức được chọn
+case $PROTOCOL_CHOICE in
+  1)
+    # VMess WebSocket
+    cat > /usr/local/etc/xray/config.json << EOF
 {
-    "server":"0.0.0.0",
-    "server_port":$SS_PORT,
-    "password":"$SS_PASSWORD",
-    "timeout":300,
-    "method":"$SS_METHOD",
-    "fast_open":true,
-    "mode":"tcp_and_udp",
-    "nameserver":"$DNS_SERVERS"
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": 1080,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "udp": true,
+        "auth": "noauth"
+      },
+      "tag": "socks-in"
+    },
+    {
+      "port": $VMESS_PORT,
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "alterId": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "$WS_PATH"
+        }
+      },
+      "tag": "vmess-in"
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      },
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blocked"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["socks-in", "vmess-in"],
+        "outboundTag": "direct"
+      }
+    ]
+  }
 }
 EOF
-
-# Cấu hình SOCKS tunnel service (sử dụng ss-redir và ss-tunnel)
-cat > /etc/systemd/system/ss-local.service << EOF
-[Unit]
-Description=Shadowsocks SOCKS Service
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-ExecStart=/usr/bin/ss-local -c /etc/shadowsocks-libev/config.json -b 127.0.0.1 -l $SOCKS_PORT -u
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
+    ;;
+  2)
+    # Trojan
+    # Tạo SSL tự ký (sẽ yêu cầu người dùng cung cấp domain và cài đặt Let's Encrypt nếu cần)
+    mkdir -p /etc/ssl/xray
+    openssl req -x509 -nodes -days 365 -newkey rsa:3072 \
+    -keyout /etc/ssl/xray/xray.key -out /etc/ssl/xray/xray.crt \
+    -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP"
+    
+    cat > /usr/local/etc/xray/config.json << EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": 1080,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "udp": true,
+        "auth": "noauth"
+      },
+      "tag": "socks-in"
+    },
+    {
+      "port": $TROJAN_PORT,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "$TROJAN_PASSWORD"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "/etc/ssl/xray/xray.crt",
+              "keyFile": "/etc/ssl/xray/xray.key"
+            }
+          ]
+        }
+      },
+      "tag": "trojan-in"
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      },
+      "tag": "direct"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["socks-in", "trojan-in"],
+        "outboundTag": "direct"
+      }
+    ]
+  }
+}
 EOF
-
-systemctl daemon-reload
-systemctl enable ss-local
-systemctl restart ss-local
-systemctl restart shadowsocks-libev
+    ;;
+  3)
+    # VLESS + Reality (giao thức hiện đại nhất)
+    # Tạo private key và public key cho Reality
+    REALITY_PRIVATE_KEY=$(xray x25519)
+    REALITY_PRIVATE_KEY=${REALITY_PRIVATE_KEY#Private key: }
+    REALITY_PUBLIC_KEY=${REALITY_PRIVATE_KEY#Public key: }
+    
+    # Chọn serverName ngẫu nhiên từ các trang web phổ biến
+    SERVER_NAMES=("www.microsoft.com" "www.amazon.com" "www.cloudflare.com" "www.apple.com" "www.google.com")
+    RANDOM_INDEX=$((RANDOM % ${#SERVER_NAMES[@]}))
+    SERVER_NAME=${SERVER_NAMES[$RANDOM_INDEX]}
+    
+    # Tạo short ID ngẫu nhiên
+    SHORT_ID=$(openssl rand -hex 8)
+    
+    cat > /usr/local/etc/xray/config.json << EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": 1080,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "udp": true,
+        "auth": "noauth"
+      },
+      "tag": "socks-in"
+    },
+    {
+      "port": $VLESS_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$SERVER_NAME:443",
+          "serverNames": [
+            "$SERVER_NAME"
+          ],
+          "privateKey": "$REALITY_PRIVATE_KEY",
+          "shortIds": ["$SHORT_ID"]
+        }
+      },
+      "tag": "vless-in"
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      },
+      "tag": "direct"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["socks-in", "vless-in"],
+        "outboundTag": "direct"
+      }
+    ]
+  }
+}
+EOF
+    ;;
+esac
 
 #############################################
-# PHẦN 5: CẤU HÌNH NGINX VÀ PAC FILE
+# PHẦN 4: CẤU HÌNH NGINX
 #############################################
 
-echo -e "${GREEN}[5/6] Cấu hình Nginx và PAC file...${NC}"
+echo -e "${GREEN}[4/6] Cấu hình Nginx...${NC}"
 
 # Cấu hình nginx
 cat > /etc/nginx/nginx.conf << EOF
@@ -193,7 +401,55 @@ http {
 EOF
 
 # Cấu hình máy chủ Nginx
-cat > /etc/nginx/sites-available/default << EOF
+if [ "$PROTOCOL" = "VMess" ]; then
+    # Cấu hình cho VMess Websocket
+    cat > /etc/nginx/sites-available/default << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $PUBLIC_IP;
+    
+    # Ngụy trang là một trang web bình thường
+    location / {
+        root /var/www/html;
+        index index.html check-ip.html;
+    }
+    
+    # Định tuyến WebSocket đến Xray
+    location $WS_PATH {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:$VMESS_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_connect_timeout 120s;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 120s;
+    }
+    
+    # PAC file cho iPhone
+    location /proxy/ {
+        root /var/www/html;
+        types { } 
+        default_type application/x-ns-proxy-autoconfig;
+        add_header Cache-Control "no-cache";
+    }
+
+    # Công cụ kiểm tra IP
+    location /ip {
+        proxy_pass https://ipinfo.io/ip;
+        proxy_set_header Host ipinfo.io;
+        proxy_set_header X-Real-IP \$remote_addr;
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+else
+    # Cấu hình đơn giản cho Trojan và VLESS (không cần websocket)
+    cat > /etc/nginx/sites-available/default << EOF
 server {
     listen 80;
     listen [::]:80;
@@ -222,6 +478,7 @@ server {
     }
 }
 EOF
+fi
 
 # Tạo thư mục và PAC file
 mkdir -p /var/www/html/proxy
@@ -263,7 +520,7 @@ cat > /var/www/html/check-ip.html << EOF
 </head>
 <body>
     <div class="container">
-        <h1>Kiểm tra Proxy Toàn Diện</h1>
+        <h1>Kiểm tra HTTP Bridge qua $PROTOCOL</h1>
         <p>Công cụ này sẽ kiểm tra xem kết nối proxy của bạn có hoạt động đúng cách không</p>
         
         <button onclick="checkIP()">Kiểm tra IP</button>
@@ -276,16 +533,16 @@ cat > /var/www/html/check-ip.html << EOF
             <h2>Thông tin cấu hình</h2>
             <table>
                 <tr>
+                    <th>Giao thức Bridge</th>
+                    <td>HTTP Bridge qua $PROTOCOL</td>
+                </tr>
+                <tr>
                     <th>HTTP Proxy</th>
                     <td>$PUBLIC_IP:$HTTP_PROXY_PORT</td>
                 </tr>
                 <tr>
                     <th>PAC URL</th>
                     <td>http://$PUBLIC_IP/proxy/proxy.pac</td>
-                </tr>
-                <tr>
-                    <th>Thiết lập iPhone</th>
-                    <td>Settings > Wi-Fi > [Mạng Wi-Fi] > Configure Proxy > Auto > Nhập PAC URL</td>
                 </tr>
             </table>
         </div>
@@ -383,10 +640,10 @@ cat > /var/www/html/index.html << EOF
 EOF
 
 #############################################
-# PHẦN 6: SCRIPT KIỂM TRA VÀ KHỞI ĐỘNG DỊCH VỤ
+# PHẦN 5: TẠO SCRIPT KIỂM TRA VÀ KHỞI ĐỘNG DỊCH VỤ
 #############################################
 
-echo -e "${GREEN}[6/6] Tạo script kiểm tra và khởi động dịch vụ...${NC}"
+echo -e "${GREEN}[5/6] Tạo script kiểm tra và khởi động dịch vụ...${NC}"
 
 # Tạo script kiểm tra kết nối
 cat > /usr/local/bin/check-proxy.sh << EOF
@@ -396,18 +653,17 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${YELLOW}====== KIỂM TRA PROXY TOÀN DIỆN ======${NC}"
+echo -e "${YELLOW}====== KIỂM TRA HTTP BRIDGE QUA $PROTOCOL ======${NC}"
 
 # Kiểm tra dịch vụ
 echo -e "\n${YELLOW}Kiểm tra trạng thái dịch vụ:${NC}"
 systemctl status tinyproxy --no-pager | grep Active || echo -e "${RED}Tinyproxy không chạy!${NC}"
-systemctl status ss-local --no-pager | grep Active || echo -e "${RED}SS-local không chạy!${NC}"
-systemctl status shadowsocks-libev --no-pager | grep Active || echo -e "${RED}Shadowsocks không chạy!${NC}"
+systemctl status xray --no-pager | grep Active || echo -e "${RED}Xray không chạy!${NC}"
 systemctl status nginx --no-pager | grep Active || echo -e "${RED}Nginx không chạy!${NC}"
 
 # Kiểm tra các cổng đang lắng nghe
 echo -e "\n${YELLOW}Cổng đang lắng nghe:${NC}"
-netstat -tuln | grep -E "$HTTP_PROXY_PORT|$SOCKS_PORT|$SS_PORT|80" || echo -e "${RED}Không tìm thấy cổng nào!${NC}"
+netstat -tuln | grep -E "$HTTP_PROXY_PORT|1080|$PROTOCOL_PORT|80" || echo -e "${RED}Không tìm thấy cổng nào!${NC}"
 
 # Kiểm tra kết nối HTTP proxy
 echo -e "\n${YELLOW}Kiểm tra kết nối HTTP proxy:${NC}"
@@ -415,15 +671,11 @@ curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip || echo -e "${
 
 # Kiểm tra kết nối SOCKS proxy
 echo -e "\n${YELLOW}Kiểm tra kết nối SOCKS proxy:${NC}"
-curl -s --socks5 127.0.0.1:$SOCKS_PORT https://ipinfo.io/ip || echo -e "${RED}SOCKS proxy không hoạt động!${NC}"
+curl -s --socks5 127.0.0.1:1080 https://ipinfo.io/ip || echo -e "${RED}SOCKS proxy không hoạt động!${NC}"
 
 # Kiểm tra kết nối trực tiếp để so sánh
 echo -e "\n${YELLOW}Kiểm tra IP trực tiếp (không qua proxy):${NC}"
 curl -s https://ipinfo.io/ip
-
-# Kiểm tra DNS sử dụng qua proxy
-echo -e "\n${YELLOW}Kiểm tra DNS qua proxy:${NC}"
-curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://dnsleaktest.com/ | grep -o "Your IP address is:.*" || echo "Không thể kiểm tra DNS"
 
 echo -e "\n${YELLOW}Kết luận:${NC}"
 IP_PROXY=\$(curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip)
@@ -432,12 +684,16 @@ IP_DIRECT=\$(curl -s https://ipinfo.io/ip)
 if [ "\$IP_PROXY" = "\$IP_DIRECT" ]; then
   echo -e "${RED}CHÚ Ý: IP qua proxy và IP trực tiếp GIỐNG NHAU! Proxy không hoạt động đúng cách!${NC}"
 else
-  echo -e "${GREEN}IP qua proxy và IP trực tiếp KHÁC NHAU. Proxy đang hoạt động tốt!${NC}"
+  echo -e "${GREEN}IP qua proxy và IP trực tiếp KHÁC NHAU. HTTP Bridge qua $PROTOCOL đang hoạt động tốt!${NC}"
 fi
+
+# Kiểm tra DNS leak
+echo -e "\n${YELLOW}Kiểm tra DNS:${NC}"
+curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://dnsleaktest.com/ | grep -o "Your IP address is:.*" || echo "Không thể kiểm tra DNS"
 
 # Kiểm tra tốc độ proxy
 echo -e "\n${YELLOW}Kiểm tra tốc độ proxy:${NC}"
-time curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://speed.hetzner.de/100MB.bin -o /dev/null || echo -e "${RED}Kiểm tra tốc độ thất bại!${NC}"
+time curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://speed.hetzner.de/10MB.bin -o /dev/null || echo -e "${RED}Kiểm tra tốc độ thất bại!${NC}"
 EOF
 chmod +x /usr/local/bin/check-proxy.sh
 
@@ -449,8 +705,7 @@ NC='\033[0m'
 
 echo -e "\${GREEN}Khởi động lại tất cả dịch vụ proxy...${NC}"
 systemctl restart tinyproxy
-systemctl restart ss-local
-systemctl restart shadowsocks-libev
+systemctl restart xray
 systemctl restart nginx
 echo -e "\${GREEN}Đã khởi động lại dịch vụ.${NC}"
 EOF
@@ -468,11 +723,10 @@ if ! curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://www.google.com -o /dev
     systemctl restart tinyproxy
 fi
 
-# Kiểm tra SOCKS proxy
-if ! curl -s --socks5 127.0.0.1:$SOCKS_PORT https://www.google.com -o /dev/null; then
-    echo "SOCKS proxy không hoạt động, khởi động lại Shadowsocks" >> \$LOG
-    systemctl restart ss-local
-    systemctl restart shadowsocks-libev
+# Kiểm tra SOCKS proxy (từ Xray)
+if ! curl -s --socks5 127.0.0.1:1080 https://www.google.com -o /dev/null; then
+    echo "SOCKS proxy không hoạt động, khởi động lại Xray" >> \$LOG
+    systemctl restart xray
 fi
 
 # Kiểm tra Nginx
@@ -494,41 +748,82 @@ chmod +x /usr/local/bin/auto-fix-proxy.sh
 # Thiết lập định kỳ kiểm tra và khởi động lại
 (crontab -l 2>/dev/null || echo "") | {
     cat
-    echo "*/5 * * * * /usr/local/bin/auto-fix-proxy.sh > /dev/null 2>&1" # Kiểm tra và sửa mỗi 5 phút
-    echo "0 */3 * * * /usr/local/bin/restart-proxy.sh > /dev/null 2>&1"  # Khởi động lại mỗi 3 giờ
+    echo "*/5 * * * * /usr/local/bin/auto-fix-proxy.sh > /dev/null 2>&1"
+    echo "0 */3 * * * /usr/local/bin/restart-proxy.sh > /dev/null 2>&1"
 } | crontab -
+
+#############################################
+# PHẦN 6: KHỞI ĐỘNG DỊCH VỤ VÀ HIỂN THỊ THÔNG TIN
+#############################################
+
+echo -e "${GREEN}[6/6] Khởi động dịch vụ và hiển thị thông tin...${NC}"
 
 # Khởi động dịch vụ
 systemctl daemon-reload
 systemctl enable tinyproxy
-systemctl enable ss-local
-systemctl enable shadowsocks-libev
+systemctl enable xray
 systemctl enable nginx
 systemctl restart tinyproxy
-systemctl restart ss-local
-systemctl restart shadowsocks-libev
+systemctl restart xray
 systemctl restart nginx
 
+# Chờ dịch vụ khởi động
+sleep 5
+
 # Kiểm tra kết nối proxy
-sleep 3
 IP_PROXY=$(curl -s -x http://127.0.0.1:$HTTP_PROXY_PORT https://ipinfo.io/ip)
 IP_DIRECT=$(curl -s https://ipinfo.io/ip)
 
+# Tạo thông tin kết nối cho client dựa trên giao thức được chọn
+case $PROTOCOL_CHOICE in
+  1)
+    # VMess WebSocket
+    VMESS_CONFIG=$(cat <<EOF
+{
+  "v": "2",
+  "ps": "HTTP-Bridge-VMess-$TAG",
+  "add": "$PUBLIC_IP",
+  "port": "80",
+  "id": "$UUID",
+  "aid": "0",
+  "net": "ws",
+  "type": "none",
+  "host": "$PUBLIC_IP",
+  "path": "$WS_PATH",
+  "tls": ""
+}
+EOF
+)
+    SHARE_LINK="vmess://$(echo $VMESS_CONFIG | jq -c . | base64 -w 0)"
+    CLIENT_INFO="VMess:\n  - Address: ${PUBLIC_IP}\n  - Port: 80\n  - UUID: ${UUID}\n  - Network: WebSocket\n  - Path: ${WS_PATH}"
+    ;;
+  2)
+    # Trojan
+    SHARE_LINK="trojan://${TROJAN_PASSWORD}@${PUBLIC_IP}:${TROJAN_PORT}"
+    CLIENT_INFO="Trojan:\n  - Address: ${PUBLIC_IP}\n  - Port: ${TROJAN_PORT}\n  - Password: ${TROJAN_PASSWORD}"
+    ;;
+  3)
+    # VLESS + Reality
+    SHARE_LINK="vless://${UUID}@${PUBLIC_IP}:${VLESS_PORT}?security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#HTTP-Bridge-VLESS-${TAG}"
+    CLIENT_INFO="VLESS Reality:\n  - Address: ${PUBLIC_IP}\n  - Port: ${VLESS_PORT}\n  - UUID: ${UUID}\n  - SNI: ${SERVER_NAME}\n  - Public Key: ${REALITY_PUBLIC_KEY}\n  - Short ID: ${SHORT_ID}"
+    ;;
+esac
+
 # Hiển thị thông tin kết nối
 echo -e "\n${BLUE}========================================================${NC}"
-echo -e "${GREEN}GIẢI PHÁP PROXY TRIỆT ĐỂ ĐÃ ĐƯỢC THIẾT LẬP${NC}"
+echo -e "${GREEN}HTTP BRIDGE QUA $PROTOCOL ĐÃ ĐƯỢC THIẾT LẬP${NC}"
 echo -e "${BLUE}========================================================${NC}"
 
-echo -e "\n${YELLOW}THÔNG TIN KẾT NỐI:${NC}"
+echo -e "\n${YELLOW}THÔNG TIN KẾT NỐI HTTP PROXY:${NC}"
 echo -e "HTTP Proxy: ${GREEN}$PUBLIC_IP:$HTTP_PROXY_PORT${NC}"
 echo -e "PAC URL: ${GREEN}http://$PUBLIC_IP/proxy/proxy.pac${NC}"
 echo -e "Trang kiểm tra IP: ${GREEN}http://$PUBLIC_IP/check-ip.html${NC}"
 
-echo -e "\n${YELLOW}THÔNG TIN SHADOWSOCKS (nếu muốn kết nối trực tiếp):${NC}"
-echo -e "Server: ${GREEN}$PUBLIC_IP${NC}"
-echo -e "Port: ${GREEN}$SS_PORT${NC}"
-echo -e "Password: ${GREEN}$SS_PASSWORD${NC}"
-echo -e "Method: ${GREEN}$SS_METHOD${NC}"
+echo -e "\n${YELLOW}THÔNG TIN CLIENT $PROTOCOL:${NC}"
+echo -e "${GREEN}$CLIENT_INFO${NC}"
+
+echo -e "\n${YELLOW}URL CHIA SẺ:${NC}"
+echo -e "${GREEN}$SHARE_LINK${NC}"
 
 echo -e "\n${YELLOW}KIỂM TRA KẾT NỐI:${NC}"
 if [ "$IP_PROXY" = "$IP_DIRECT" ]; then
@@ -537,7 +832,7 @@ if [ "$IP_PROXY" = "$IP_DIRECT" ]; then
 else
   echo -e "${GREEN}IP qua proxy: $IP_PROXY${NC}"
   echo -e "${GREEN}IP trực tiếp: $IP_DIRECT${NC}"
-  echo -e "${GREEN}Proxy đang hoạt động tốt!${NC}"
+  echo -e "${GREEN}HTTP Bridge qua $PROTOCOL đang hoạt động tốt!${NC}"
 fi
 
 echo -e "\n${YELLOW}HƯỚNG DẪN CẤU HÌNH IPHONE:${NC}"
@@ -559,11 +854,11 @@ echo -e "${BLUE}========================================================${NC}"
 mkdir -p /etc/proxy-setup
 cat > /etc/proxy-setup/config.json << EOF
 {
+  "protocol": "$PROTOCOL",
+  "protocol_port": $PROTOCOL_PORT,
   "http_proxy_port": $HTTP_PROXY_PORT,
-  "socks_port": $SOCKS_PORT,
-  "shadowsocks_port": $SS_PORT,
-  "shadowsocks_password": "$SS_PASSWORD",
-  "shadowsocks_method": "$SS_METHOD",
+  "uuid": "$UUID",
+  "share_link": "$SHARE_LINK",
   "public_ip": "$PUBLIC_IP",
   "installation_date": "$(date)",
   "version": "1.0.0"
@@ -572,5 +867,5 @@ EOF
 chmod 600 /etc/proxy-setup/config.json
 
 # Chạy kiểm tra chi tiết
-echo -e "\n${YELLOW}Chạy kiểm tra chi tiết để xác minh cài đặt:${NC}"
+echo -e "\n${YELLOW}Đang chạy kiểm tra chi tiết để xác minh cài đặt:${NC}"
 /usr/local/bin/check-proxy.sh
