@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script cài đặt HTTP to VMess Bridge
-# Sử dụng trên Ubuntu server
+# Sử dụng trên Ubuntu server, không có xác thực HTTP
 
 # Kiểm tra quyền root
 if [[ $EUID -ne 0 ]]; then
@@ -9,13 +9,9 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# Cập nhật hệ thống
-echo "Đang cập nhật hệ thống..."
-apt update && apt upgrade -y
-
 # Cài đặt các công cụ cần thiết
 echo "Đang cài đặt các công cụ cần thiết..."
-apt install -y curl wget unzip nginx apache2-utils
+apt install -y curl wget unzip nginx
 
 # Tạo thư mục cho V2Ray và PAC
 echo "Đang tạo thư mục cấu hình..."
@@ -35,18 +31,6 @@ echo "Vui lòng lưu lại UUID này để cấu hình client: $UUID"
 SERVER_IP=$(curl -s https://api.ipify.org)
 echo "IP máy chủ của bạn là: $SERVER_IP"
 
-# Tạo tên người dùng và mật khẩu cho HTTP proxy
-echo "Thiết lập xác thực cho HTTP proxy..."
-echo -n "Nhập tên người dùng cho HTTP proxy: "
-read HTTP_USER
-echo -n "Nhập mật khẩu cho HTTP proxy: "
-read -s HTTP_PASS
-echo ""
-
-# Tạo file mật khẩu
-echo "Tạo file xác thực..."
-htpasswd -bc /usr/local/etc/v2ray/http_auth $HTTP_USER $HTTP_PASS
-
 # Cấu hình V2Ray
 echo "Đang tạo cấu hình V2Ray..."
 cat > /usr/local/etc/v2ray/config.json << EOF
@@ -62,12 +46,6 @@ cat > /usr/local/etc/v2ray/config.json << EOF
       "protocol": "http",
       "settings": {
         "timeout": 300,
-        "accounts": [
-          {
-            "user": "$HTTP_USER",
-            "pass": "$HTTP_PASS"
-          }
-        ],
         "allowTransparent": false,
         "userLevel": 0
       },
@@ -180,7 +158,6 @@ echo "IP máy chủ: $SERVER_IP"
 echo "Cổng HTTP: 8080"
 echo "Cổng VMess: 10086"
 echo "UUID VMess: $UUID"
-echo "Tên người dùng HTTP: $HTTP_USER"
 echo "URL của tệp PAC: http://$SERVER_IP/pac/proxy.pac"
 echo "======================="
 echo "Hướng dẫn cấu hình iPhone:"
