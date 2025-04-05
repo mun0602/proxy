@@ -91,26 +91,8 @@ EOF
 echo "Đang tạo tệp PAC..."
 cat > /var/www/html/pac/proxy.pac << EOF
 function FindProxyForURL(url, host) {
-    // Các trang web Trung Quốc phổ biến
-    if (shExpMatch(host, "*.qq.com") || 
-        shExpMatch(host, "*.weibo.com") || 
-        shExpMatch(host, "*.baidu.com") || 
-        shExpMatch(host, "*.douyin.com") ||
-        shExpMatch(host, "*.tiktok.com") ||
-        shExpMatch(host, "*.bilibili.com") ||
-        shExpMatch(host, "*.zhihu.com") ||
-        shExpMatch(host, "*.163.com") ||
-        shExpMatch(host, "*.taobao.com") ||
-        shExpMatch(host, "*.jd.com") ||
-        shExpMatch(host, "*.alipay.com") ||
-        shExpMatch(host, "*.youku.com") ||
-        shExpMatch(host, "*.iqiyi.com") ||
-        shExpMatch(host, "*.tmall.com")) {
-        return "PROXY $SERVER_IP:8080; DIRECT";
-    }
-    
-    // Truy cập trực tiếp các trang khác
-    return "DIRECT";
+    // Chuyển hướng TẤT CẢ các trang web qua proxy
+    return "PROXY $SERVER_IP:8080; DIRECT";
 }
 EOF
 
