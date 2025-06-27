@@ -57,7 +57,11 @@ processed/
 
 # Test images and data
 test_images/
+test_output/
+demo_output/
 sample_data/
+demo.py
+demo_config.yaml
 
 # OS files
 .DS_Store

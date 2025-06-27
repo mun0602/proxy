@@ -25,6 +25,31 @@ output/
     └── Not_Suitable/
 ```
 
+## Quick Start
+
+### 1. Installation
+```bash
+cd avatar_filter
+pip install -r requirements.txt
+```
+
+### 2. Create Configuration
+```bash
+python src/main.py create-config
+```
+
+### 3. Process Images
+```bash
+# Preview mode (no files moved)
+python src/main.py process -i /path/to/images --preview
+
+# Process and organize images
+python src/main.py process -i /path/to/images -o /path/to/output
+```
+
+### 4. View Results
+Check the output directory and `summary_report.txt` for detailed results.
+
 ## Installation
 
 ### Prerequisites
