@@ -1,0 +1,61 @@
+avatar_criteria:
+  max_blur_threshold: 50
+  max_brightness: 220
+  max_face_ratio: 0.85
+  max_head_pose_angle: 30
+  min_brightness: 50
+  min_contrast: 30
+  min_face_confidence: 0.8
+  min_face_ratio: 0.15
+  min_resolution:
+  - 224
+  - 224
+error_handling:
+  continue_on_error: true
+  log_errors: true
+  max_retries: 3
+image_processing:
+  normalization:
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+  supported_formats:
+  - .jpg
+  - .jpeg
+  - .png
+  - .webp
+  target_size:
+  - 224
+  - 224
+models:
+  face_detection:
+    confidence_threshold: 0.5
+    device: NPU
+    path: models/face-detection-adas-0001.xml
+  face_quality:
+    device: NPU
+    path: models/face-reidentification-retail-0095.xml
+    quality_threshold: 0.6
+  gender_model:
+    confidence_threshold: 0.7
+    device: NPU
+    path: models/gender-recognition-retail-0013.xml
+output:
+  base_directory: output
+  structure:
+  - Male/Suitable
+  - Male/Not_Suitable
+  - Female/Suitable
+  - Female/Not_Suitable
+  - Uncertain/Suitable
+  - Uncertain/Not_Suitable
+processing:
+  batch_size: 32
+  num_workers: 4
+  progress_bar: true
+  verbose_logging: true

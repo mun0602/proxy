@@ -1,0 +1,25 @@
+# AI Avatar Image Filter Tool Requirements
+# Core dependencies for Intel NPU and OpenVINO
+openvino>=2023.3.0
+openvino-dev>=2023.3.0
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Machine learning and utilities
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# Configuration and CLI
+PyYAML>=6.0
+click>=8.0.0
+tqdm>=4.65.0
+
+# Logging and utilities
+colorama>=0.4.6
+pathlib2>=2.3.7
+
+# Optional: For advanced face detection (fallback if OpenVINO models not available)
+# mediapipe>=0.10.0
